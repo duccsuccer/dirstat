@@ -122,7 +122,13 @@ fn apply_fixups(buf: &mut [u8]) -> Option<()> {
 /// (allocated, logical) from an unnamed $DATA attribute.
 fn data_sizes(attr: &[u8], non_resident: bool) -> Option<(u64, u64)> {
     if non_resident {
-        Some((u64_at(attr, 0x28)?, u64_at(attr, 0x30)?))
+        // @0x28 is the virtual size rounded up; compressed or sparse streams report the stored size at @0x40.
+        let allocated = if u16_at(attr, 0x22)? != 0 && attr.len() >= 0x48 {
+            u64_at(attr, 0x40)?
+        } else {
+            u64_at(attr, 0x28)?
+        };
+        Some((allocated, u64_at(attr, 0x30)?))
     } else {
         Some((0, resident_value(attr)?.len() as u64))
     }
@@ -196,16 +202,24 @@ mod tests {
     }
 
     fn nonresident_attr(ty: u32, attr_flags: u16, allocated: u64, real: u64) -> Vec<u8> {
-        let mut a = vec![0u8; 0x48];
+        let mut a = vec![0u8; 0x50];
         put(&mut a, 0, &ty.to_le_bytes());
-        put(&mut a, 4, &0x48u32.to_le_bytes());
+        put(&mut a, 4, &0x50u32.to_le_bytes());
         a[8] = 1;
         put(&mut a, 10, &0x40u16.to_le_bytes());
         put(&mut a, 12, &attr_flags.to_le_bytes());
-        put(&mut a, 0x20, &0x40u16.to_le_bytes());
+        put(&mut a, 0x20, &0x48u16.to_le_bytes());
         put(&mut a, 0x28, &allocated.to_le_bytes());
         put(&mut a, 0x30, &real.to_le_bytes());
         put(&mut a, 0x38, &real.to_le_bytes());
+        a
+    }
+
+    /// Compressed or sparse non-resident $DATA: compression unit @0x22 and on-disk size @0x40.
+    fn compressed_attr(attr_flags: u16, allocated: u64, real: u64, compressed: u64) -> Vec<u8> {
+        let mut a = nonresident_attr(TYPE_DATA, attr_flags, allocated, real);
+        put(&mut a, 0x22, &4u16.to_le_bytes());
+        put(&mut a, 0x40, &compressed.to_le_bytes());
         a
     }
 
@@ -307,12 +321,12 @@ mod tests {
     }
 
     #[test]
-    fn sparse_and_compressed_use_allocated_not_logical() {
+    fn sparse_and_compressed_use_compressed_size_on_disk() {
         for attr_flags in [0x8000u16, 0x0001] {
-            let data = nonresident_attr(TYPE_DATA, attr_flags, 4096, 1_000_000);
+            let data = compressed_attr(attr_flags, 1_048_576, 1_000_000, 65_536);
             let mut rec = make_record(FLAG_IN_USE, &[(5, NS_WIN32, "sparse.bin")], &[data]);
             let r = parse_record(&mut rec, 1).expect("record should parse");
-            assert_eq!(r.allocated, 4096);
+            assert_eq!(r.allocated, 65_536);
             assert_eq!(r.logical, 1_000_000);
         }
     }

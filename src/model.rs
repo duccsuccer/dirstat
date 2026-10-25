@@ -151,8 +151,12 @@ impl Tree {
     }
 
     /// Detaches `id` from its parent and subtracts its sizes from every ancestor and from `exts`.
-    /// The arena slot is kept so other `NodeId`s stay valid. The root cannot be removed.
+    /// The arena slot is kept so other `NodeId`s stay valid. A no-op for the root and for any node
+    /// no longer attached to it (already removed, or inside a removed directory), so sizes are never subtracted twice.
     pub fn remove(&mut self, id: NodeId) {
+        if !self.is_attached(id) {
+            return;
+        }
         let node = &self.nodes[id.0 as usize];
         let Some(parent) = node.parent else { return };
         let (size, logical) = (node.size, node.logical);
@@ -179,6 +183,14 @@ impl Tree {
                 stat.count -= 1;
             }
         }
+    }
+
+    /// True when following parents from `id` reaches the root, i.e. `id` has not been removed.
+    pub fn is_attached(&self, mut id: NodeId) -> bool {
+        while let Some(parent) = self.nodes[id.0 as usize].parent {
+            id = parent;
+        }
+        id == self.root
     }
 
     /// Percent (0 to 100) of the parent's size; the root counts as 100 percent of itself.
@@ -257,6 +269,63 @@ mod tests {
         assert_eq!(t.nodes[root.0 as usize].size, 7);
         assert_eq!(t.nodes[root.0 as usize].logical, 7);
         assert_eq!(t.nodes[root.0 as usize].children, vec![a, g]);
+        let bin = t.exts.iter().find(|e| e.ext == "bin").unwrap();
+        assert_eq!((bin.size, bin.count), (7, 1));
+    }
+
+    #[test]
+    fn remove_directory_subtracts_its_files_from_exts_once() {
+        let mut b = TreeBuilder::new("root");
+        let root = NodeId(0);
+        let a = b.add(root, "a", true, 0, 0);
+        b.add(a, "x.bin", false, 10, 10);
+        let sub = b.add(a, "sub", true, 0, 0);
+        b.add(sub, "y.bin", false, 20, 20);
+        b.add(sub, "z.txt", false, 5, 5);
+        b.add(root, "g.bin", false, 7, 7);
+        let mut t = b.finish();
+
+        t.remove(a);
+
+        assert_eq!(t.nodes[root.0 as usize].size, 7);
+        assert_eq!(t.nodes[root.0 as usize].children.len(), 1);
+        let bin = t.exts.iter().find(|e| e.ext == "bin").unwrap();
+        assert_eq!((bin.size, bin.count), (7, 1));
+        let txt = t.exts.iter().find(|e| e.ext == "txt").unwrap();
+        assert_eq!((txt.size, txt.count), (0, 0));
+    }
+
+    #[test]
+    fn remove_of_detached_node_is_noop() {
+        let mut b = TreeBuilder::new("root");
+        let root = NodeId(0);
+        let f = b.add(root, "f.bin", false, 10, 10);
+        b.add(root, "g.bin", false, 7, 7);
+        let mut t = b.finish();
+
+        t.remove(f);
+        t.remove(f);
+        t.remove(root);
+
+        assert_eq!(t.nodes[root.0 as usize].size, 7);
+        let bin = t.exts.iter().find(|e| e.ext == "bin").unwrap();
+        assert_eq!((bin.size, bin.count), (7, 1));
+    }
+
+    #[test]
+    fn remove_descendant_of_removed_dir_is_noop() {
+        let mut b = TreeBuilder::new("root");
+        let root = NodeId(0);
+        let a = b.add(root, "a", true, 0, 0);
+        let f = b.add(a, "f.bin", false, 10, 10);
+        b.add(root, "g.bin", false, 7, 7);
+        let mut t = b.finish();
+
+        t.remove(a);
+        t.remove(f);
+
+        assert_eq!(t.nodes[a.0 as usize].size, 10);
+        assert_eq!(t.nodes[root.0 as usize].size, 7);
         let bin = t.exts.iter().find(|e| e.ext == "bin").unwrap();
         assert_eq!((bin.size, bin.count), (7, 1));
     }

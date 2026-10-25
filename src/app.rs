@@ -1,10 +1,12 @@
 //! Application state, the scan lifecycle and the top bar.
 
 use eframe::egui;
+use crate::actions::{self, DeleteOutcome};
 use crate::model::{NodeId, Tree};
 use crate::scan::{self, ScanEvent, ScanHandle, ScanMode, ScanTarget};
 use crate::{ui_legend, ui_tree, ui_treemap::{self, TreemapCache}};
 use std::collections::HashSet;
+use std::path::Path;
 use std::sync::mpsc::{channel, Receiver, Sender};
 
 pub struct AppState {
@@ -21,6 +23,10 @@ pub struct AppState {
     pub treemap_cache: Option<TreemapCache>,
     /// Set by a treemap click; the tree pane scrolls to `selected` once, then clears it.
     pub scroll_to_selected: bool,
+    /// Item whose delete confirmation dialog is open.
+    pub pending_delete: Option<NodeId>,
+    /// Why the last delete did not happen; shown in a dialog until dismissed.
+    pub delete_notice: Option<String>,
 }
 
 impl AppState {
@@ -39,6 +45,8 @@ impl AppState {
             skipped: 0,
             treemap_cache: None,
             scroll_to_selected: false,
+            pending_delete: None,
+            delete_notice: None,
         }
     }
 
@@ -64,6 +72,28 @@ impl AppState {
         self.treemap_cache = None;
     }
 
+    /// Sends the selected item to the Recycle Bin once the user has confirmed. Never deletes the scan root.
+    pub fn delete_selected(&mut self, confirmed: bool) {
+        self.delete_selected_with(confirmed, actions::recycle);
+    }
+
+    pub(crate) fn delete_selected_with(&mut self, confirmed: bool, recycle: impl FnOnce(&Path) -> DeleteOutcome) {
+        let (Some(tree), Some(id)) = (self.tree.as_mut(), self.selected) else { return };
+        // A detached node's path would be relative (just its name), so it must never reach `recycle`.
+        if !confirmed || id == tree.root || !tree.is_attached(id) {
+            return;
+        }
+        match recycle(Path::new(&tree.path(id))) {
+            DeleteOutcome::Recycled => {
+                self.selected = tree.nodes[id.0 as usize].parent;
+                tree.remove(id);
+                self.delete_notice = None;
+                self.invalidate_treemap();
+            }
+            DeleteOutcome::Refused(message) | DeleteOutcome::Failed(message) => self.delete_notice = Some(message),
+        }
+    }
+
     /// Applies the scan events that arrived since the last call.
     pub fn pump(&mut self) {
         while let Ok(event) = self.rx.try_recv() {
@@ -72,6 +102,8 @@ impl AppState {
                 ScanEvent::Done { tree, mode, skipped } => {
                     self.expanded = HashSet::from([tree.root]);
                     self.selected = None;
+                    // Ids from the old tree may name a different item in the new one.
+                    self.pending_delete = None;
                     self.treemap_cache = None;
                     self.tree = Some(tree);
                     self.mode = Some(mode);
@@ -110,7 +142,48 @@ impl eframe::App for AppState {
                 ui_tree::show(ui, self);
             }
         });
+        delete_dialogs(ui.ctx(), self);
     }
+}
+
+/// The delete confirmation for `pending_delete`, then the notice explaining a refused or failed delete.
+fn delete_dialogs(ctx: &egui::Context, state: &mut AppState) {
+    if let (Some(id), Some(tree)) = (state.pending_delete, &state.tree) {
+        let text = format!("Move {} ({}) to the Recycle Bin?", tree.path(id), ui_tree::format_size(tree.nodes[id.0 as usize].size));
+        let mut choice = None;
+        dialog("Delete to Recycle Bin").show(ctx, |ui| {
+            ui.label(text);
+            ui.horizontal(|ui| {
+                if ui.button("Delete").clicked() {
+                    choice = Some(true);
+                }
+                if ui.button("Cancel").clicked() {
+                    choice = Some(false);
+                }
+            });
+        });
+        if let Some(delete) = choice {
+            state.pending_delete = None;
+            if delete {
+                state.selected = Some(id);
+                state.delete_selected(true);
+            }
+        }
+    }
+    if let Some(notice) = &state.delete_notice {
+        let mut dismissed = false;
+        dialog("Not deleted").show(ctx, |ui| {
+            ui.label(notice);
+            dismissed = ui.button("OK").clicked();
+        });
+        if dismissed {
+            state.delete_notice = None;
+        }
+    }
+}
+
+fn dialog(title: &str) -> egui::Window<'_> {
+    egui::Window::new(title).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
 }
 
 fn top_bar(ui: &mut egui::Ui, state: &mut AppState) {
@@ -210,6 +283,108 @@ mod tests {
         assert_eq!(state.skipped, 2);
         assert!(state.scan.is_none());
         assert_eq!(state.expanded, HashSet::from([root]));
+    }
+
+    /// Root "C:" with "a" (dir) holding "f.bin" (10 bytes), and "g.bin" (7 bytes).
+    fn state_with_file() -> (AppState, NodeId, NodeId) {
+        let mut b = TreeBuilder::new("C:");
+        let a = b.add(NodeId(0), "a", true, 0, 0);
+        let f = b.add(a, "f.bin", false, 10, 10);
+        b.add(NodeId(0), "g.bin", false, 7, 7);
+        let mut state = AppState::new();
+        state.tree = Some(b.finish());
+        state.selected = Some(f);
+        (state, a, f)
+    }
+
+    fn root_size(state: &AppState) -> u64 {
+        let tree = state.tree.as_ref().unwrap();
+        tree.nodes[tree.root.0 as usize].size
+    }
+
+    #[test]
+    fn delete_selected_requires_confirmation() {
+        let (mut state, _, f) = state_with_file();
+        state.delete_selected_with(false, |_| panic!("recycle must not be called"));
+        assert_eq!(root_size(&state), 17);
+        assert_eq!(state.selected, Some(f));
+    }
+
+    #[test]
+    fn delete_root_is_never_performed() {
+        let (mut state, _, _) = state_with_file();
+        state.selected = state.tree.as_ref().map(|t| t.root);
+        state.delete_selected_with(true, |_| panic!("recycle must not be called"));
+        assert_eq!(root_size(&state), 17);
+    }
+
+    #[test]
+    fn delete_without_selection_does_nothing() {
+        let (mut state, _, _) = state_with_file();
+        state.selected = None;
+        state.delete_selected_with(true, |_| panic!("recycle must not be called"));
+        assert_eq!(root_size(&state), 17);
+    }
+
+    #[test]
+    fn refused_delete_leaves_tree_unchanged() {
+        let (mut state, _, f) = state_with_file();
+        state.delete_selected_with(true, |path| {
+            assert_eq!(path, Path::new(r"C:\a\f.bin"));
+            DeleteOutcome::Refused("no bin".into())
+        });
+        assert_eq!(root_size(&state), 17);
+        assert_eq!(state.selected, Some(f));
+        assert_eq!(state.delete_notice.as_deref(), Some("no bin"));
+    }
+
+    #[test]
+    fn failed_delete_sets_notice() {
+        let (mut state, _, _) = state_with_file();
+        state.delete_selected_with(true, |_| DeleteOutcome::Failed("locked".into()));
+        assert_eq!(root_size(&state), 17);
+        assert_eq!(state.delete_notice.as_deref(), Some("locked"));
+    }
+
+    #[test]
+    fn recycled_delete_updates_tree_in_place() {
+        let (mut state, a, f) = state_with_file();
+        state.delete_notice = Some("old".into());
+        state.treemap_cache = Some(TreemapCache {
+            size: (1.0, 1.0),
+            blocks: Vec::new(),
+            mesh: Default::default(),
+            origin: egui::Pos2::ZERO,
+            highlight_for: None,
+            highlight: Default::default(),
+        });
+        state.delete_selected_with(true, |_| DeleteOutcome::Recycled);
+        let tree = state.tree.as_ref().unwrap();
+        assert_eq!(tree.nodes[a.0 as usize].size, 0);
+        assert_eq!(root_size(&state), 7);
+        assert!(!state.tree.as_ref().unwrap().nodes[a.0 as usize].children.contains(&f));
+        assert_eq!(state.selected, Some(a));
+        assert!(state.delete_notice.is_none());
+        assert!(state.treemap_cache.is_none());
+    }
+
+    #[test]
+    fn detached_selection_is_never_deleted() {
+        let (mut state, a, f) = state_with_file();
+        state.tree.as_mut().unwrap().remove(a);
+        state.selected = Some(f);
+        state.delete_selected_with(true, |_| panic!("recycle must not be called"));
+        assert_eq!(root_size(&state), 7);
+    }
+
+    #[test]
+    fn rescan_clears_pending_delete() {
+        let (mut state, _, f) = state_with_file();
+        state.pending_delete = Some(f);
+        let tx = state.install_channel();
+        tx.send(ScanEvent::Done { tree: tree(), mode: ScanMode::Walk, skipped: 0 }).unwrap();
+        state.pump();
+        assert!(state.pending_delete.is_none());
     }
 
     #[test]

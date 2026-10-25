@@ -6,8 +6,10 @@ edition = "2021"
 [dependencies]
 eframe = "0.37.0"
 rayon = "1.12.0"
+arboard = "3.7.0"
 rfd = "0.17.2"
-windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl"] }
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_WindowsProgramming", "Win32_UI_Shell"] }
+windows-core = "0.62.2"
 
 [build-dependencies]
 embed-resource = "3.0.12"

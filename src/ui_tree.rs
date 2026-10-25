@@ -1,9 +1,11 @@
 //! Directory tree pane (top-left).
 
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Shape, Stroke, TextStyle, Vec2};
+use crate::actions;
 use crate::app::AppState;
 use crate::model::{NodeId, Tree};
 use std::collections::HashSet;
+use std::path::Path;
 
 const INDENT: f32 = 16.0;
 const ARROW_W: f32 = 16.0;
@@ -28,6 +30,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
     let expanded = &state.expanded;
     let row_h = ui.text_style_height(&TextStyle::Body) + 4.0;
     let mut click = None;
+    let mut menu = None;
 
     header(ui, row_h);
     let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]);
@@ -66,6 +69,12 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
                     let on_arrow = expandable && response.interact_pointer_pos().is_some_and(|p| arrow_rect.contains(p));
                     click = Some(if on_arrow { Click::Toggle(id) } else { Click::Select(id) });
                 }
+                if response.secondary_clicked() {
+                    click = Some(Click::Select(id));
+                }
+                if let Some(action) = item_menu(&response, id != tree.root) {
+                    menu = Some((id, action));
+                }
             }
         });
 
@@ -77,6 +86,49 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
             }
         }
         None => {}
+    }
+    if let Some((id, action)) = menu {
+        apply_menu_action(state, id, action);
+    }
+}
+
+pub(crate) enum MenuAction {
+    Open,
+    CopyPath,
+    Delete,
+}
+
+/// Right-click menu for one item; "Delete to Recycle Bin" is offered only when `deletable`.
+pub(crate) fn item_menu(response: &egui::Response, deletable: bool) -> Option<MenuAction> {
+    let mut action = None;
+    response.context_menu(|ui| {
+        if ui.button("Open in Explorer").clicked() {
+            action = Some(MenuAction::Open);
+        }
+        if ui.button("Copy path").clicked() {
+            action = Some(MenuAction::CopyPath);
+        }
+        if deletable && ui.button("Delete to Recycle Bin").clicked() {
+            action = Some(MenuAction::Delete);
+        }
+    });
+    action
+}
+
+/// Runs a context-menu choice; delete only opens the confirmation dialog. Open and copy failures go to `error`.
+pub(crate) fn apply_menu_action(state: &mut AppState, id: NodeId, action: MenuAction) {
+    let Some(tree) = &state.tree else { return };
+    let path = tree.path(id);
+    let result = match action {
+        MenuAction::Open => actions::open_in_explorer(Path::new(&path)).map_err(|e| e.to_string()),
+        MenuAction::CopyPath => actions::copy_path(&path),
+        MenuAction::Delete => {
+            state.pending_delete = Some(id);
+            Ok(())
+        }
+    };
+    if let Err(e) = result {
+        state.error = Some(format!("{path}: {e}"));
     }
 }
 

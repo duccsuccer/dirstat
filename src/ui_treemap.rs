@@ -5,7 +5,7 @@ use crate::app::AppState;
 use crate::model::{NodeId, Tree};
 use crate::treemap;
 use crate::ui_legend::color_for;
-use crate::ui_tree::{ensure_visible, format_size, placeholder};
+use crate::ui_tree::{apply_menu_action, ensure_visible, format_size, item_menu, placeholder};
 use std::sync::Arc;
 
 /// Above this many selected blocks the outline is one bounding box, so a huge selection costs no more than a small one.
@@ -80,7 +80,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
     painter.add(Shape::Mesh(Arc::clone(&cache.highlight)));
 
     let hit = |pos: Pos2| hit_test(&cache.blocks, pos.x - origin.x, pos.y - origin.y);
-    if response.clicked() {
+    if response.clicked() || response.secondary_clicked() {
         if let Some(id) = response.interact_pointer_pos().and_then(hit) {
             state.selected = Some(id);
             ensure_visible(tree, &mut state.expanded, id);
@@ -88,6 +88,8 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
             ui.ctx().request_repaint();
         }
     }
+    // The menu acts on the selection, which a right-click on a block has just set.
+    let menu = state.selected.and_then(|id| item_menu(&response, id != tree.root).map(|action| (id, action)));
     if let Some(id) = response.hover_pos().and_then(hit) {
         let node = &tree.nodes[id.0 as usize];
         response.on_hover_ui_at_pointer(|ui| {
@@ -95,6 +97,9 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
             ui.label(format_size(node.size));
             ui.label(format!("Logical size: {}", format_size(node.logical)));
         });
+    }
+    if let Some((id, action)) = menu {
+        apply_menu_action(state, id, action);
     }
 }
 

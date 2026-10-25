@@ -667,8 +667,11 @@ mod tests {
     #[test]
     #[ignore = "needs an elevated shell"]
     fn mft_matches_walk_on_same_folder() {
-        let dir = tempfile::tempdir().unwrap();
-        let d = dir.path();
+        // The scanned folder and the hard link's outside folder share one temp dir, so both are on C:.
+        let base = tempfile::tempdir().unwrap();
+        let scanned = base.path().join("scanned");
+        let d = scanned.as_path();
+        fs::create_dir(d).unwrap();
         assert!(d.starts_with("C:\\"), "temp dir {} is not on C:", d.display());
         fs::write(d.join("empty.bin"), b"").unwrap();
         fs::write(d.join("resident.txt"), b"small enough to live in the MFT record").unwrap();
@@ -686,9 +689,10 @@ mod tests {
         fs::write(&compressed, b"dirstat ".repeat(256 * 1024)).unwrap();
         ok(Command::new("compact").arg("/c").arg(&compressed));
         // A hard link whose other name lives outside the scanned folder (the walk counts it once, here).
-        let outside = tempfile::tempdir().unwrap();
-        fs::write(outside.path().join("original.bin"), vec![4u8; 20_000]).unwrap();
-        fs::hard_link(outside.path().join("original.bin"), d.join("linked_from_outside.bin")).unwrap();
+        let outside = base.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("original.bin"), vec![4u8; 20_000]).unwrap();
+        fs::hard_link(outside.join("original.bin"), d.join("linked_from_outside.bin")).unwrap();
         // WOF (compact /exe) compression: its MFT-mode size is otherwise unverified.
         let wof = d.join("wof.txt");
         fs::write(&wof, b"dirstat wof ".repeat(32 * 1024)).unwrap();

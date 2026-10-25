@@ -12,9 +12,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::Mutex;
+use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::{
-    FileAttributeTagInfo, FileStandardInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
+    FileAttributeTagInfo, FileStandardInfo, GetDiskFreeSpaceW, GetFileInformationByHandle, GetFileInformationByHandleEx,
+    GetVolumeInformationW, GetVolumePathNameW,
     BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     FILE_STANDARD_INFO,
@@ -33,7 +35,7 @@ pub fn walk(root: &Path, cancel: &AtomicBool, on_progress: &mut dyn FnMut(u64, u
     // The walk runs on a worker thread so this thread can report progress; the callback itself need not be Send.
     let (entries, skipped) = std::thread::scope(|s| {
         let worker = s.spawn(|| {
-            let ctx = Ctx { cancel, seen: Mutex::new(HashSet::new()), progress: tx };
+            let ctx = Ctx { cancel, seen: Mutex::new(HashSet::new()), progress: tx, ntfs_cluster: ntfs_cluster(&scan_root) };
             scan_dir(&scan_root, &ctx)
         });
         let (mut files, mut bytes) = (0, 0);
@@ -85,6 +87,35 @@ struct Ctx<'a> {
     seen: Mutex<HashSet<(u32, u64)>>,
     /// Per-directory (files, allocated bytes) deltas.
     progress: Sender<(u64, u64)>,
+    /// Cluster size when the walked volume is NTFS.
+    ntfs_cluster: Option<u64>,
+}
+
+/// Cluster size of the volume holding `root` when it is NTFS; `None` for other filesystems or when unreadable.
+fn ntfs_cluster(root: &Path) -> Option<u64> {
+    let mut volume = [0u16; 261];
+    unsafe { GetVolumePathNameW(&HSTRING::from(root), &mut volume) }.ok()?;
+    // GetVolumePathNameW wrote a NUL-terminated string into `volume`, which outlives every use below.
+    let volume = PCWSTR(volume.as_ptr());
+    let mut fs_name = [0u16; 32];
+    unsafe { GetVolumeInformationW(volume, None, None, None, None, Some(&mut fs_name)) }.ok()?;
+    if String::from_utf16_lossy(&fs_name).trim_end_matches('\0') != "NTFS" {
+        return None;
+    }
+    let (mut sectors, mut bytes) = (0u32, 0u32);
+    unsafe { GetDiskFreeSpaceW(volume, Some(&mut sectors), Some(&mut bytes), None, None) }.ok()?;
+    Some(u64::from(sectors) * u64::from(bytes)).filter(|&cluster| cluster > 0)
+}
+
+/// Size on disk from the allocation NTFS reports. A stream kept inside its MFT record (resident) reports its length
+/// rounded up to 8 bytes, never a whole number of clusters, yet takes no clusters; it counts as 0, as in the MFT scan.
+/// shortcut: on 512-byte-cluster volumes a resident file of 505 to 512 bytes looks non-resident; upgrade if it matters.
+fn size_on_disk(allocated: u64, ntfs_cluster: Option<u64>) -> u64 {
+    if ntfs_cluster.is_some_and(|cluster| !allocated.is_multiple_of(cluster)) {
+        0
+    } else {
+        allocated
+    }
 }
 
 enum Entry {
@@ -145,7 +176,7 @@ fn scan_entry(entry: &DirEntry, ctx: &Ctx) -> (Option<Entry>, u64) {
     if info.links > 1 && !ctx.seen.lock().unwrap().insert((info.volume, info.index)) {
         return (None, 0);
     }
-    (Some(Entry::File { name, size: info.allocated, logical: info.logical }), 0)
+    (Some(Entry::File { name, size: size_on_disk(info.allocated, ctx.ntfs_cluster), logical: info.logical }), 0)
 }
 
 struct FileInfo {
@@ -288,6 +319,26 @@ mod tests {
         let small = &tree.nodes[find(&tree, "sub\\small.txt").unwrap().0 as usize];
         assert_eq!(small.logical, 3);
         assert_eq!(tree.nodes[tree.root.0 as usize].logical, 5003);
+    }
+
+    #[test]
+    fn resident_file_takes_no_space_on_disk() {
+        // NTFS keeps a file this small inside its MFT record and reports its length rounded to 8 as allocated.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("resident.txt"), b"small enough to live in the MFT record").unwrap();
+
+        let (tree, _) = scan(dir.path());
+
+        let node = &tree.nodes[find(&tree, "resident.txt").unwrap().0 as usize];
+        assert_eq!((node.size, node.logical), (0, 38));
+    }
+
+    #[test]
+    fn only_ntfs_partial_clusters_count_as_resident() {
+        assert_eq!(size_on_disk(40, Some(4096)), 0);
+        assert_eq!(size_on_disk(8192, Some(4096)), 8192);
+        assert_eq!(size_on_disk(0, Some(4096)), 0);
+        assert_eq!(size_on_disk(40, None), 40);
     }
 
     #[test]

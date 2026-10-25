@@ -257,8 +257,8 @@ fn root_name(letter: char, subtree: Option<&Path>) -> String {
     name.strip_prefix(r"\\?\").unwrap_or(&name).trim_end_matches('\\').to_string()
 }
 
-/// Folds extension records into their base records: a file with no data of its own (both sizes 0) takes the
-/// sizes of the first `$DATA` extent held in an extension, and a base record with no `$FILE_NAME` of its own
+/// Folds extension records into their base records: a file with no unnamed data of its own (logical size 0) adds
+/// the sizes of the first `$DATA` extent held in an extension, and a base record with no `$FILE_NAME` of its own
 /// takes one held in an extension. Base records still nameless are dropped, as are extensions whose base record
 /// is not in use.
 fn merge_extensions(parsed: Vec<Parsed>) -> Vec<MftRecord> {
@@ -276,8 +276,9 @@ fn merge_extensions(parsed: Vec<Parsed>) -> Vec<MftRecord> {
     }
     records.retain_mut(|r| {
         if let Some(e) = extensions.get_mut(&r.index) {
-            if let (false, 0, 0, Some((allocated, logical))) = (r.is_dir, r.allocated, r.logical, e.data) {
-                (r.allocated, r.logical) = (allocated, logical);
+            // The base may already hold named streams' allocation, so the unnamed stream's is added to it.
+            if let (false, 0, Some((allocated, logical))) = (r.is_dir, r.logical, e.data) {
+                (r.allocated, r.logical) = (r.allocated + allocated, logical);
             }
             if let (true, Some((parent, name))) = (r.name.is_empty(), e.name.take()) {
                 (r.parent, r.name) = (parent, name);
@@ -531,10 +532,13 @@ mod tests {
             ext(30, Some((1 << 30, 1_000_000_000)), None),
             Parsed::Base(rec(31, 5, "own.bin", false, 4096)),
             ext(31, Some((999, 999)), None),
+            // Only a named stream in the base: the unnamed stream's sizes are added to it.
+            Parsed::Base(MftRecord { logical: 0, ..rec(32, 5, "ads.bin", false, 512) }),
+            ext(32, Some((8192, 5000)), None),
         ];
         let t = build_tree(merge_extensions(parsed), "C:", &[]).unwrap();
         let root = &t.nodes[t.root.0 as usize];
-        assert_eq!((root.size, root.logical), ((1 << 30) + 4096, 1_000_000_000 + 2048));
+        assert_eq!((root.size, root.logical), ((1 << 30) + 4096 + 512 + 8192, 1_000_000_000 + 2048 + 5000));
     }
 
     #[test]

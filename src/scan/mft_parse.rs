@@ -7,7 +7,9 @@ pub struct MftRecord {
     pub parent: u64,
     pub name: String,
     pub is_dir: bool,
+    /// Size on disk of every `$DATA` stream, named ones included.
     pub allocated: u64,
+    /// Length of the unnamed `$DATA` stream.
     pub logical: u64,
     /// True only when the record has a `$REPARSE_POINT` attribute whose tag is a name-surrogate
     /// (symlink `0xA000000C` or mount point `0xA0000003`). Other reparse tags (cloud placeholders,
@@ -80,6 +82,8 @@ pub fn parse_any(buf: &mut [u8], index: u64) -> Option<Parsed> {
 
     let mut names = Vec::new();
     let mut data = None;
+    // Size on disk of named $DATA streams (alternate data streams, WOF's WofCompressedData).
+    let mut named_allocated = 0;
     let mut is_reparse = false;
     let mut off = u16_at(buf, 0x14)? as usize;
     loop {
@@ -95,9 +99,14 @@ pub fn parse_any(buf: &mut [u8], index: u64) -> Option<Parsed> {
         let non_resident = attr[8] != 0;
         if ty == ATTR_FILE_NAME && !non_resident {
             names.push(parse_file_name(resident_value(attr)?)?);
-        } else if ty == ATTR_DATA && attr[9] == 0 && data.is_none() && (!non_resident || u64_at(attr, 0x10)? == 0) {
+        } else if ty == ATTR_DATA && (!non_resident || u64_at(attr, 0x10)? == 0) {
             // Only the extent starting at VCN 0 carries the stream sizes; later extents report 0.
-            data = Some(data_sizes(attr, non_resident)?);
+            let sizes = data_sizes(attr, non_resident)?;
+            if attr[9] != 0 {
+                named_allocated += sizes.0;
+            } else if data.is_none() {
+                data = Some(sizes);
+            }
         } else if ty == ATTR_REPARSE_POINT && !non_resident {
             let tag = u32_at(resident_value(attr)?, 0)?;
             is_reparse |= tag == TAG_SYMLINK || tag == TAG_MOUNT_POINT;
@@ -112,8 +121,10 @@ pub fn parse_any(buf: &mut [u8], index: u64) -> Option<Parsed> {
     }
     let is_dir = flags & FLAG_DIRECTORY != 0;
     // $DATA living only in an extension record is filled in from that record by the caller (`Extension`).
+    // shortcut: named streams held only in extension records are not counted; rare, upgrade if a scan shows them.
     let (allocated, logical) = match (is_dir, data) {
-        (false, Some(sizes)) => sizes,
+        (false, Some((allocated, logical))) => (allocated + named_allocated, logical),
+        (false, None) => (named_allocated, 0),
         _ => (0, 0),
     };
 
@@ -402,6 +413,28 @@ mod tests {
         put(&mut data, 0x20, &0x40u16.to_le_bytes());
         let mut rec = make_record(FLAG_IN_USE, &[(5, NS_WIN32, "hdr.bin")], &[data]);
         assert_eq!(parse_record(&mut rec, 1).expect("record should parse").allocated, 8192);
+    }
+
+    fn named(mut attr: Vec<u8>) -> Vec<u8> {
+        attr[9] = 1; // name length; the name itself is not read
+        attr
+    }
+
+    #[test]
+    fn named_data_streams_add_size_on_disk_but_not_length() {
+        let attrs = [nonresident_attr(TYPE_DATA, 0, 8192, 5000), named(nonresident_attr(TYPE_DATA, 0, 4096, 100))];
+        let mut rec = make_record(FLAG_IN_USE, &[(5, NS_WIN32, "ads.bin")], &attrs);
+        let r = parse_record(&mut rec, 1).expect("record should parse");
+        assert_eq!((r.allocated, r.logical), (12288, 5000));
+    }
+
+    #[test]
+    fn wof_file_counts_its_compressed_stream() {
+        // WOF: the unnamed stream is sparse with nothing stored; the data sits in the named WofCompressedData stream.
+        let attrs = [compressed_attr(0x8000, 0, 393_216, 393_216, 0), named(nonresident_attr(TYPE_DATA, 0, 16_384, 9_000))];
+        let mut rec = make_record(FLAG_IN_USE, &[(5, NS_WIN32, "wof.txt")], &attrs);
+        let r = parse_record(&mut rec, 1).expect("record should parse");
+        assert_eq!((r.allocated, r.logical), (16_384, 393_216));
     }
 
     #[test]

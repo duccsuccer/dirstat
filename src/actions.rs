@@ -4,12 +4,13 @@ use std::cell::Cell;
 use std::ffi::c_void;
 use std::io::ErrorKind;
 use std::os::windows::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use windows::core::{implement, Ref, Result as WinResult, HRESULT, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{E_ABORT, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
 use windows::Win32::Storage::FileSystem::{GetDiskFreeSpaceExW, GetDriveTypeW, GetVolumeNameForVolumeMountPointW, GetVolumePathNameW};
 use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_APARTMENTTHREADED};
+use windows::Win32::System::SystemInformation::GetWindowsDirectoryW;
 use windows::Win32::System::Registry::{RegGetValueW, HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD};
 use windows::Win32::System::WindowsProgramming::{DRIVE_CDROM, DRIVE_FIXED, DRIVE_RAMDISK, DRIVE_REMOTE, DRIVE_REMOVABLE};
 use windows::Win32::UI::Shell::{
@@ -23,11 +24,26 @@ use windows_core::ComObject;
 pub fn open_in_explorer(path: &Path) -> std::io::Result<()> {
     // Explorer wants `/select,"path"` as one argument, which Rust's own quoting does not produce; Windows paths
     // cannot contain `"`, so the quotes cannot be broken out of. Explorer exits with code 1 even on success,
-    // so only a failure to start it counts.
-    Command::new("explorer.exe")
+    // so only a failure to start it counts. Run by full path: this process is elevated, and a bare name would
+    // be looked up in the application folder first.
+    Command::new(explorer_exe(windows_dir())?)
         .raw_arg(format!("/select,\"{}\"", path.display()))
         .spawn()
         .map(drop)
+}
+
+/// The Windows folder, from GetWindowsDirectoryW; `None` when it cannot be read.
+fn windows_dir() -> Option<PathBuf> {
+    let mut buf = [0u16; 261];
+    let len = unsafe { GetWindowsDirectoryW(Some(&mut buf)) } as usize;
+    (len > 0 && len < buf.len()).then(|| PathBuf::from(String::from_utf16_lossy(&buf[..len])))
+}
+
+/// `explorer.exe` in the Windows folder `windows_dir`.
+fn explorer_exe(windows_dir: Option<PathBuf>) -> std::io::Result<PathBuf> {
+    windows_dir
+        .map(|dir| dir.join("explorer.exe"))
+        .ok_or_else(|| std::io::Error::other("cannot find the Windows folder to start Explorer"))
 }
 
 pub fn copy_path(path: &str) -> Result<(), String> {
@@ -475,6 +491,14 @@ mod tests {
         assert!(matches!(outcome("x", &sink_with(false, false, true), ok(), true), DeleteOutcome::Failed(m) if m.contains("still exists")));
         assert!(matches!(outcome("x", &sink_with(false, false, false), Err(E_ABORT.into()), true), DeleteOutcome::Failed(_)));
         assert!(matches!(outcome("x", &sink_with(false, false, false), ok(), true), DeleteOutcome::Failed(_)));
+    }
+
+    #[test]
+    fn explorer_is_run_from_the_windows_folder() {
+        let exe = explorer_exe(Some(PathBuf::from(r"C:\Windows"))).unwrap();
+        assert_eq!(exe, Path::new(r"C:\Windows\explorer.exe"));
+        assert!(explorer_exe(None).is_err());
+        assert!(explorer_exe(windows_dir()).unwrap().is_file());
     }
 
     #[test]

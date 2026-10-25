@@ -15,8 +15,13 @@ pub fn run() -> eframe::Result {
             ..Default::default()
         },
         Box::new(|cc| {
+            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
             app::apply_theme(&cc.egui_ctx);
-            Ok(Box::new(app::AppState::new()))
+            let mut state = app::AppState::new();
+            if let Ok(RawWindowHandle::Win32(handle)) = cc.window_handle().map(|h| h.as_raw()) {
+                state.hwnd = handle.hwnd.get();
+            }
+            Ok(Box::new(state))
         }),
     )
 }

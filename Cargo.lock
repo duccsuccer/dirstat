@@ -733,11 +733,11 @@ dependencies = [
  "arboard",
  "eframe",
  "embed-resource",
+ "raw-window-handle",
  "rayon",
  "rfd",
  "tempfile",
  "windows",
- "windows-core",
 ]
 
 [[package]]

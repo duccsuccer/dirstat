@@ -1,12 +1,12 @@
 //! Treemap pane (bottom).
 
 use eframe::egui::{self, Align2, Color32, FontId, Mesh, Pos2, Sense, Shape, Vec2};
-use crate::app::AppState;
+use crate::app::{has_shell_menu, AppState};
 use crate::model::{NodeId, Tree};
 use crate::treemap;
 use crate::ui_legend::color_for;
 use crate::actions::shell_path;
-use crate::ui_tree::{apply_menu_action, ensure_visible, format_size, item_menu, placeholder};
+use crate::ui_tree::{ensure_visible, format_size, placeholder};
 use std::sync::Arc;
 
 /// Above this many selected blocks the outline is one bounding box, so a huge selection costs no more than a small one.
@@ -112,15 +112,12 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
             state.selected = Some(id);
             ensure_visible(tree, &mut state.expanded, id);
             state.scroll_to_selected = true;
+            if response.secondary_clicked() && has_shell_menu(tree, id) {
+                state.pending_menu = Some((id, ui.input(|i| i.modifiers.shift)));
+            }
             ui.ctx().request_repaint();
         }
     }
-    // The menu acts on the selection, which a right-click on a block has just set.
-    // The unaccounted item is no file: nothing to open, copy or delete.
-    let menu = state
-        .selected
-        .filter(|&id| !tree.is_unaccounted(id))
-        .and_then(|id| item_menu(&response, id != tree.root).map(|action| (id, action)));
     if let Some(id) = response.hover_pos().and_then(hit) {
         let node = &tree.nodes[id.0 as usize];
         response.on_hover_ui_at_pointer(|ui| {
@@ -128,9 +125,6 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
             ui.label(format_size(node.size));
             ui.label(format!("Logical size: {}", format_size(node.logical)));
         });
-    }
-    if let Some((id, action)) = menu {
-        apply_menu_action(state, id, action);
     }
 }
 

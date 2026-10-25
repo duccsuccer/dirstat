@@ -1,12 +1,10 @@
 //! Directory tree pane (top-left), and the table drawing it shares with the file-type pane.
 
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Shape, Stroke, TextStyle, Vec2};
-use crate::actions;
-use crate::app::AppState;
+use crate::app::{has_shell_menu, AppState};
 use crate::model::{NodeId, Tree};
 use crate::ui_legend::color_for;
 use std::collections::HashSet;
-use std::path::Path;
 
 const INDENT: f32 = 16.0;
 const ARROW_W: f32 = 16.0;
@@ -83,11 +81,8 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
                 }
                 if response.secondary_clicked() {
                     click = Some(Click::Select(id));
-                }
-                // The unaccounted item is no file: nothing to open, copy or delete.
-                if !tree.is_unaccounted(id) {
-                    if let Some(action) = item_menu(&response, id != tree.root) {
-                        menu = Some((id, action));
+                    if has_shell_menu(tree, id) {
+                        menu = Some(id);
                     }
                 }
             }
@@ -103,56 +98,9 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
         }
         None => {}
     }
-    if let Some((id, action)) = menu {
-        apply_menu_action(state, id, action);
-    }
-}
-
-pub(crate) enum MenuAction {
-    Open,
-    CopyPath,
-    Delete,
-    DeletePermanently,
-}
-
-/// Right-click menu for one item; the two deletes are offered only when `deletable`.
-pub(crate) fn item_menu(response: &egui::Response, deletable: bool) -> Option<MenuAction> {
-    let mut action = None;
-    response.context_menu(|ui| {
-        if ui.button("Open in Explorer").clicked() {
-            action = Some(MenuAction::Open);
-        }
-        if ui.button("Copy path").clicked() {
-            action = Some(MenuAction::CopyPath);
-        }
-        if deletable && ui.button("Delete to Recycle Bin").clicked() {
-            action = Some(MenuAction::Delete);
-        }
-        if deletable && ui.button("Delete permanently…").clicked() {
-            action = Some(MenuAction::DeletePermanently);
-        }
-    });
-    action
-}
-
-/// Runs a context-menu choice; a delete only opens its confirmation dialog. Open and copy failures go to `error`.
-pub(crate) fn apply_menu_action(state: &mut AppState, id: NodeId, action: MenuAction) {
-    let Some(tree) = &state.tree else { return };
-    let path = tree.path(id);
-    let result = match action {
-        MenuAction::Open => actions::open_in_explorer(Path::new(&actions::shell_path(path.clone()))).map_err(|e| e.to_string()),
-        MenuAction::CopyPath => actions::copy_path(&actions::shell_path(path.clone())),
-        MenuAction::Delete => {
-            (state.pending_delete, state.pending_permanent) = (Some(id), None);
-            Ok(())
-        }
-        MenuAction::DeletePermanently => {
-            (state.pending_delete, state.pending_permanent) = (None, Some(id));
-            Ok(())
-        }
-    };
-    if let Err(e) = result {
-        state.error = Some(format!("{path}: {e}"));
+    if let Some(id) = menu {
+        state.pending_menu = Some((id, ui.input(|i| i.modifiers.shift)));
+        ui.ctx().request_repaint();
     }
 }
 

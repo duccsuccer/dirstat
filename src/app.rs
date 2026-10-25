@@ -1,7 +1,7 @@
 //! Application state, the scan lifecycle and the top bar.
 
 use eframe::egui;
-use crate::actions::{self, DeleteOutcome};
+use crate::actions;
 use crate::model::{NodeId, Tree};
 use crate::scan::{self, ScanEvent, ScanHandle, ScanMode, ScanTarget};
 use crate::{ui_legend, ui_tree, ui_treemap::{self, TreemapCache}};
@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::time::Instant;
+use windows::Win32::Foundation::HWND;
 
 pub struct AppState {
     pub tree: Option<Tree>,
@@ -24,12 +25,11 @@ pub struct AppState {
     pub treemap_cache: Option<TreemapCache>,
     /// Set by a treemap click; the tree pane scrolls to `selected` once, then clears it.
     pub scroll_to_selected: bool,
-    /// Item whose delete confirmation dialog is open.
-    pub pending_delete: Option<NodeId>,
-    /// Item whose permanent-delete confirmation dialog is open.
-    pub pending_permanent: Option<NodeId>,
-    /// Why the last delete did not happen; shown in a dialog until dismissed.
-    pub delete_notice: Option<String>,
+    /// Item right-clicked in the last frame, and whether Shift was held; its shell menu opens in the next frame,
+    /// once the selection has been drawn.
+    pub pending_menu: Option<(NodeId, bool)>,
+    /// The main window, as the shell menu's owner; 0 when unknown.
+    pub hwnd: isize,
     /// (total, free) bytes of the volume holding the scan target, read when the scan starts.
     pub disk: Option<(u64, u64)>,
     pub scan_started: Option<Instant>,
@@ -61,9 +61,8 @@ impl AppState {
             skipped: 0,
             treemap_cache: None,
             scroll_to_selected: false,
-            pending_delete: None,
-            pending_permanent: None,
-            delete_notice: None,
+            pending_menu: None,
+            hwnd: 0,
             disk: None,
             scan_started: None,
             scan_secs: None,
@@ -98,34 +97,43 @@ impl AppState {
         self.treemap_cache = None;
     }
 
-    /// Sends the selected item to the Recycle Bin once the user has confirmed. Never deletes the scan root.
-    pub fn delete_selected(&mut self, confirmed: bool) {
-        self.delete_selected_with(confirmed, actions::recycle);
-    }
-
-    /// Deletes the selected item for good, without the Recycle Bin, once the user has confirmed. Never the scan root.
-    pub fn delete_selected_permanently(&mut self, confirmed: bool) {
-        self.delete_selected_with(confirmed, |path, _| actions::delete_permanently(path));
-    }
-
-    /// Runs `recycle` (or a permanent delete) on the confirmed selection and updates the tree when it is gone.
-    pub(crate) fn delete_selected_with(&mut self, confirmed: bool, recycle: impl FnOnce(&Path, u64) -> DeleteOutcome) {
-        let (Some(tree), Some(id)) = (self.tree.as_mut(), self.selected) else { return };
-        // A detached node's path would be relative (just its name), so it must never reach `recycle`.
-        if !confirmed || id == tree.root || !tree.is_attached(id) || tree.is_unaccounted(id) {
+    /// Shows Explorer's context menu for item `id` and, once its command has run, drops the item from the tree if
+    /// the command removed it (Delete, Shift+Delete). Errors go to `error`.
+    pub fn shell_menu(&mut self, id: NodeId, extended: bool) {
+        let Some(tree) = &self.tree else { return };
+        if !tree.is_attached(id) || !has_shell_menu(tree, id) {
             return;
         }
-        // The larger of the two sizes, so the bin-limit check can only err towards refusing.
-        let node = &tree.nodes[id.0 as usize];
-        let size = node.logical.max(node.size);
-        match recycle(Path::new(&tree.path(id)), size) {
-            DeleteOutcome::Recycled | DeleteOutcome::Deleted => {
-                self.selected = tree.nodes[id.0 as usize].parent;
-                tree.remove(id);
-                self.delete_notice = None;
-                self.invalidate_treemap();
-            }
-            DeleteOutcome::Refused(message) | DeleteOutcome::Failed(message) => self.delete_notice = Some(message),
+        let path = actions::shell_path(tree.path(id));
+        match actions::show_shell_menu(HWND(self.hwnd as *mut _), Path::new(&path), extended) {
+            Ok(true) => self.forget_if_gone(id, exists),
+            Ok(false) => {}
+            Err(e) => self.error = Some(format!("{path}: {}", e.message())),
+        }
+    }
+
+    /// Removes item `id` from the tree, taking its sizes and counts off every total, when `exists` says its path is
+    /// gone. Never the root, the unaccounted item or an item already removed.
+    pub(crate) fn forget_if_gone(&mut self, id: NodeId, exists: impl FnOnce(&Path) -> bool) {
+        let Some(tree) = self.tree.as_mut() else { return };
+        // A detached node's path would be relative (just its name), so it must never be checked.
+        if !tree.is_attached(id) || !has_shell_menu(tree, id) || exists(Path::new(&tree.path(id))) {
+            return;
+        }
+        self.selected = tree.nodes[id.0 as usize].parent;
+        tree.remove(id);
+        self.invalidate_treemap();
+    }
+
+    /// Copies the selected item's path to the clipboard (Ctrl+C). The unaccounted item has none.
+    fn copy_selected_path(&mut self) {
+        let (Some(tree), Some(id)) = (&self.tree, self.selected) else { return };
+        if tree.is_unaccounted(id) {
+            return;
+        }
+        let path = actions::shell_path(tree.path(id));
+        if let Err(e) = actions::copy_path(&path) {
+            self.error = Some(format!("{path}: {e}"));
         }
     }
 
@@ -149,8 +157,7 @@ impl AppState {
                     self.expanded = HashSet::from([tree.root]);
                     self.selected = None;
                     // Ids from the old tree may name a different item in the new one.
-                    self.pending_delete = None;
-                    self.pending_permanent = None;
+                    self.pending_menu = None;
                     self.treemap_cache = None;
                     self.tree = Some(tree);
                     self.mode = Some(mode);
@@ -173,6 +180,12 @@ impl eframe::App for AppState {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if let Some((id, extended)) = self.pending_menu.take() {
+            self.shell_menu(id, extended);
+        }
+        if ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy))) {
+            self.copy_selected_path();
+        }
         egui::Panel::top("top_bar").show(ui, |ui| top_bar(ui, self));
         egui::Panel::top("tabs").show(ui, |ui| {
             // Only one view exists; the tab is there for the familiar layout.
@@ -199,80 +212,18 @@ impl eframe::App for AppState {
                 ui_tree::show(ui, self);
             }
         });
-        delete_dialogs(ui.ctx(), self);
     }
 }
 
-/// The delete confirmations for `pending_delete` and `pending_permanent`, then the notice explaining a refused or
-/// failed delete.
-fn delete_dialogs(ctx: &egui::Context, state: &mut AppState) {
-    if let (Some(id), Some(tree)) = (state.pending_delete, &state.tree) {
-        let text = format!("Move {} ({}) to the Recycle Bin?", tree.path(id), ui_tree::format_size(tree.nodes[id.0 as usize].size));
-        let mut choice = None;
-        dialog("Delete to Recycle Bin").show(ctx, |ui| {
-            ui.label(text);
-            ui.horizontal(|ui| {
-                if ui.button("Delete").clicked() {
-                    choice = Some(true);
-                }
-                if ui.button("Cancel").clicked() {
-                    choice = Some(false);
-                }
-            });
-        });
-        if let Some(delete) = choice {
-            state.pending_delete = None;
-            if delete {
-                state.selected = Some(id);
-                state.delete_selected(true);
-            }
-        }
-    }
-    if let (Some(id), Some(tree)) = (state.pending_permanent, &state.tree) {
-        let text = format!(
-            "Permanently delete {} ({})?\n\nIt will not go to the Recycle Bin. This cannot be undone.",
-            tree.path(id),
-            ui_tree::format_size(tree.nodes[id.0 as usize].size)
-        );
-        let mut choice = None;
-        dialog("Delete permanently").show(ctx, |ui| {
-            ui.label(text);
-            ui.horizontal(|ui| {
-                let cancel = ui.button("Cancel");
-                // Enter or Space acts on the focused button, so focus starts on Cancel.
-                if ui.memory(|m| m.focused().is_none()) {
-                    cancel.request_focus();
-                }
-                if cancel.clicked() {
-                    choice = Some(false);
-                }
-                if ui.button("Delete permanently").clicked() {
-                    choice = Some(true);
-                }
-            });
-        });
-        if let Some(delete) = choice {
-            state.pending_permanent = None;
-            if delete {
-                state.selected = Some(id);
-                state.delete_selected_permanently(true);
-            }
-        }
-    }
-    if let Some(notice) = &state.delete_notice {
-        let mut dismissed = false;
-        dialog("Not deleted").show(ctx, |ui| {
-            ui.label(notice);
-            dismissed = ui.button("OK").clicked();
-        });
-        if dismissed {
-            state.delete_notice = None;
-        }
-    }
+/// True when item `id` is a real file or folder below the scan root. The root (often a whole drive) and the
+/// unaccounted item get no shell menu.
+pub(crate) fn has_shell_menu(tree: &Tree, id: NodeId) -> bool {
+    id != tree.root && !tree.is_unaccounted(id)
 }
 
-fn dialog(title: &str) -> egui::Window<'_> {
-    egui::Window::new(title).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+/// False only when nothing is at `path` any more; a link counts as itself, whatever it points to.
+fn exists(path: &Path) -> bool {
+    !matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
 }
 
 /// Dark, compact look: near-black panels, faint row stripes, blue selection.
@@ -495,54 +446,19 @@ mod tests {
     }
 
     #[test]
-    fn delete_selected_requires_confirmation() {
+    fn item_still_there_after_the_menu_stays() {
         let (mut state, _, f) = state_with_file();
-        state.delete_selected_with(false, |_, _| panic!("recycle must not be called"));
-        assert_eq!(root_size(&state), 17);
-        assert_eq!(state.selected, Some(f));
-    }
-
-    #[test]
-    fn delete_root_is_never_performed() {
-        let (mut state, _, _) = state_with_file();
-        state.selected = state.tree.as_ref().map(|t| t.root);
-        state.delete_selected_with(true, |_, _| panic!("recycle must not be called"));
-        assert_eq!(root_size(&state), 17);
-    }
-
-    #[test]
-    fn delete_without_selection_does_nothing() {
-        let (mut state, _, _) = state_with_file();
-        state.selected = None;
-        state.delete_selected_with(true, |_, _| panic!("recycle must not be called"));
-        assert_eq!(root_size(&state), 17);
-    }
-
-    #[test]
-    fn refused_delete_leaves_tree_unchanged() {
-        let (mut state, _, f) = state_with_file();
-        state.delete_selected_with(true, |path, size| {
+        state.forget_if_gone(f, |path| {
             assert_eq!(path, Path::new(r"C:\a\f.bin"));
-            assert_eq!(size, 10);
-            DeleteOutcome::Refused("no bin".into())
+            true
         });
         assert_eq!(root_size(&state), 17);
         assert_eq!(state.selected, Some(f));
-        assert_eq!(state.delete_notice.as_deref(), Some("no bin"));
     }
 
     #[test]
-    fn failed_delete_sets_notice() {
-        let (mut state, _, _) = state_with_file();
-        state.delete_selected_with(true, |_, _| DeleteOutcome::Failed("locked".into()));
-        assert_eq!(root_size(&state), 17);
-        assert_eq!(state.delete_notice.as_deref(), Some("locked"));
-    }
-
-    #[test]
-    fn recycled_delete_updates_tree_in_place() {
+    fn item_gone_after_the_menu_leaves_the_tree() {
         let (mut state, a, f) = state_with_file();
-        state.delete_notice = Some("old".into());
         state.treemap_cache = Some(TreemapCache {
             size: (1.0, 1.0),
             blocks: Vec::new(),
@@ -552,66 +468,64 @@ mod tests {
             highlight_for: None,
             highlight: Default::default(),
         });
-        state.delete_selected_with(true, |_, _| DeleteOutcome::Recycled);
+        state.forget_if_gone(f, |_| false);
         let tree = state.tree.as_ref().unwrap();
         assert_eq!(tree.nodes[a.0 as usize].size, 0);
+        assert_eq!(tree.nodes[a.0 as usize].files, 0);
         assert_eq!(root_size(&state), 7);
-        assert!(!state.tree.as_ref().unwrap().nodes[a.0 as usize].children.contains(&f));
+        assert!(!tree.nodes[a.0 as usize].children.contains(&f));
         assert_eq!(state.selected, Some(a));
-        assert!(state.delete_notice.is_none());
         assert!(state.treemap_cache.is_none());
     }
 
     #[test]
-    fn detached_selection_is_never_deleted() {
+    fn root_is_never_forgotten() {
+        let (mut state, _, _) = state_with_file();
+        let root = state.tree.as_ref().unwrap().root;
+        state.forget_if_gone(root, |_| panic!("the root must not be checked"));
+        assert_eq!(root_size(&state), 17);
+    }
+
+    #[test]
+    fn detached_item_is_never_checked() {
         let (mut state, a, f) = state_with_file();
         state.tree.as_mut().unwrap().remove(a);
-        state.selected = Some(f);
-        state.delete_selected_with(true, |_, _| panic!("recycle must not be called"));
+        state.forget_if_gone(f, |_| panic!("a detached item must not be checked"));
         assert_eq!(root_size(&state), 7);
     }
 
     #[test]
-    fn permanent_delete_updates_tree_in_place() {
-        let (mut state, a, _) = state_with_file();
-        state.delete_selected_with(true, |path, _| {
-            assert_eq!(path, Path::new(r"C:\a\f.bin"));
-            DeleteOutcome::Deleted
-        });
-        assert_eq!(root_size(&state), 7);
-        assert_eq!(state.selected, Some(a));
-    }
-
-    #[test]
-    fn rescan_clears_pending_permanent_delete() {
+    fn unaccounted_item_has_no_menu_and_is_never_forgotten() {
         let (mut state, _, f) = state_with_file();
-        state.pending_permanent = Some(f);
-        let tx = state.install_channel();
-        tx.send(ScanEvent::Done { tree: tree(), mode: ScanMode::Walk, skipped: 0 }).unwrap();
-        state.pump();
-        assert!(state.pending_permanent.is_none());
-    }
-
-    #[test]
-    fn unaccounted_item_is_never_deleted() {
-        let (mut state, _, _) = state_with_file();
         let tree = state.tree.as_mut().unwrap();
         tree.add_unaccounted(100);
         let item = tree.nodes[tree.root.0 as usize].children[0];
         assert!(tree.is_unaccounted(item));
-        state.selected = Some(item);
-        state.delete_selected_with(true, |_, _| panic!("recycle must not be called"));
+        assert!(!has_shell_menu(tree, item));
+        assert!(!has_shell_menu(tree, tree.root));
+        assert!(has_shell_menu(tree, f));
+        state.forget_if_gone(item, |_| panic!("the unaccounted item must not be checked"));
         assert_eq!(root_size(&state), 100);
     }
 
     #[test]
-    fn rescan_clears_pending_delete() {
+    fn rescan_clears_pending_menu() {
         let (mut state, _, f) = state_with_file();
-        state.pending_delete = Some(f);
+        state.pending_menu = Some((f, false));
         let tx = state.install_channel();
         tx.send(ScanEvent::Done { tree: tree(), mode: ScanMode::Walk, skipped: 0 }).unwrap();
         state.pump();
-        assert!(state.pending_delete.is_none());
+        assert!(state.pending_menu.is_none());
+    }
+
+    #[test]
+    fn exists_sees_files_and_misses_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("here.txt");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(exists(&file));
+        assert!(exists(dir.path()));
+        assert!(!exists(&dir.path().join("gone.txt")));
     }
 
     #[test]

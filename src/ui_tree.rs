@@ -121,8 +121,8 @@ pub(crate) fn apply_menu_action(state: &mut AppState, id: NodeId, action: MenuAc
     let Some(tree) = &state.tree else { return };
     let path = tree.path(id);
     let result = match action {
-        MenuAction::Open => actions::open_in_explorer(Path::new(&path)).map_err(|e| e.to_string()),
-        MenuAction::CopyPath => actions::copy_path(&path),
+        MenuAction::Open => actions::open_in_explorer(Path::new(&actions::shell_path(path.clone()))).map_err(|e| e.to_string()),
+        MenuAction::CopyPath => actions::copy_path(&actions::shell_path(path.clone())),
         MenuAction::Delete => {
             state.pending_delete = Some(id);
             Ok(())

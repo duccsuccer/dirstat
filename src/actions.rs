@@ -46,6 +46,15 @@ fn explorer_exe(windows_dir: Option<PathBuf>) -> std::io::Result<PathBuf> {
         .ok_or_else(|| std::io::Error::other("cannot find the Windows folder to start Explorer"))
 }
 
+/// `path` as Explorer and the clipboard need it: a drive root `C:` (which means "current folder on C:")
+/// becomes `C:\`.
+pub fn shell_path(mut path: String) -> String {
+    if path.ends_with(':') {
+        path.push('\\');
+    }
+    path
+}
+
 pub fn copy_path(path: &str) -> Result<(), String> {
     arboard::Clipboard::new()
         .and_then(|mut clipboard| clipboard.set_text(path))
@@ -499,6 +508,13 @@ mod tests {
         assert_eq!(exe, Path::new(r"C:\Windows\explorer.exe"));
         assert!(explorer_exe(None).is_err());
         assert!(explorer_exe(windows_dir()).unwrap().is_file());
+    }
+
+    #[test]
+    fn drive_root_gets_a_backslash() {
+        assert_eq!(shell_path("C:".into()), r"C:\");
+        assert_eq!(shell_path(r"C:\Users".into()), r"C:\Users");
+        assert_eq!(shell_path(r"\\server\share".into()), r"\\server\share");
     }
 
     #[test]

@@ -51,4 +51,5 @@ Walk rows were measured unelevated on one machine, with the file-cache state not
 - Windows and NTFS only for the fast path. Other filesystems (FAT32, exFAT, network shares) use the slower walk.
 - The MFT scan and the delete-refusal cases have **not yet been verified on a real volume**.
 - Large, heavily fragmented files whose data lives in `$ATTRIBUTE_LIST` extension records: the MFT scan takes their sizes from the `$DATA` extent that starts at VCN 0 (the only one that records the stream sizes), wherever it lives, and takes a missing `$FILE_NAME` from an extension record. Only the first name found in extension records is used (further hard links held there are ignored), and a `$REPARSE_POINT` held only in an extension record is not seen.
+- The sizes of WOF-compressed files (`compact /exe`, used by Windows for system files) in MFT mode are unverified; the elevated test compares them with the walk.
 - There is no scan-time tree preview: the tree and treemap appear when the scan ends.

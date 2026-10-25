@@ -13,6 +13,8 @@ pub struct MftRecord {
     /// (symlink `0xA000000C` or mount point `0xA0000003`). Other reparse tags (cloud placeholders,
     /// WOF, dedup) are false, so those files count as normal files.
     pub is_reparse: bool,
+    /// Further hard links as (parent, name), after the one in `parent`/`name`; empty for a single link.
+    pub extra_links: Vec<(u64, String)>,
 }
 
 const RECORD_SECTOR: usize = 512;
@@ -123,6 +125,7 @@ pub fn parse_any(buf: &mut [u8], index: u64) -> Option<Parsed> {
         allocated,
         logical,
         is_reparse,
+        extra_links: names.iter().filter(|n| n.namespace != NS_DOS).skip(1).map(|n| (n.parent, n.name.clone())).collect(),
     }))
 }
 
@@ -334,6 +337,13 @@ mod tests {
         let r = parse_record(&mut rec, 1).expect("record should parse");
         assert_eq!(r.parent, 5);
         assert_eq!(r.name, "first.txt");
+        assert_eq!(r.extra_links, [(9, "second.txt".to_string())]);
+    }
+
+    #[test]
+    fn single_link_with_dos_name_has_no_extra_links() {
+        let mut rec = make_record(FLAG_IN_USE, &[(5, NS_DOS, "HELLO~1.TXT"), (5, NS_WIN32, "hello world.txt")], &[]);
+        assert!(parse_record(&mut rec, 1).expect("record should parse").extra_links.is_empty());
     }
 
     #[test]

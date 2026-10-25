@@ -316,12 +316,23 @@ pub fn build_tree(records: Vec<MftRecord>, root_name: &str, folder: &[String]) -
     // Iterative, so deep chains cannot overflow the stack. Each record sits under one parent, so none is
     // added twice, and orphans and parent cycles are never reached from `start`.
     let mut stack = vec![(start, NodeId(0))];
+    // Folders in the kept subtree, for hard links whose first name lies outside it (subtree scans only).
+    let mut dirs: HashMap<u64, NodeId> = HashMap::new();
     while let Some((index, node)) = stack.pop() {
+        if !folder.is_empty() {
+            dirs.insert(index, node);
+        }
         for r in children(index) {
             let id = builder.add(node, &r.name, r.is_dir, r.allocated, r.logical);
             if r.is_dir {
                 stack.push((r.index, id));
             }
+        }
+    }
+    // A file is added once: under its first name when that is in the subtree, else under its first link that is.
+    for r in kept.iter().filter(|r| !r.extra_links.is_empty() && !folder.is_empty() && !dirs.contains_key(&r.parent)) {
+        if let Some((node, name)) = r.extra_links.iter().find_map(|(p, name)| Some((*dirs.get(p)?, name))) {
+            builder.add(node, name, r.is_dir, r.allocated, r.logical);
         }
     }
     Ok(builder.finish())
@@ -374,7 +385,7 @@ mod tests {
     use std::process::Command;
 
     fn rec(index: u64, parent: u64, name: &str, is_dir: bool, size: u64) -> MftRecord {
-        MftRecord { index, parent, name: name.to_string(), is_dir, allocated: size, logical: size / 2, is_reparse: false }
+        MftRecord { index, parent, name: name.to_string(), is_dir, allocated: size, logical: size / 2, is_reparse: false, extra_links: Vec::new() }
     }
 
     fn link(index: u64, parent: u64, name: &str, is_dir: bool) -> MftRecord {
@@ -454,6 +465,27 @@ mod tests {
         let t = build_tree(recs, r"C:\Users\me", &comps(&["Users", "me"])).unwrap();
         assert_eq!(paths(&t), [r"C:\Users\me", r"C:\Users\me\a.bin", r"C:\Users\me\docs", r"C:\Users\me\docs\b.bin"]);
         assert_eq!(t.nodes[t.root.0 as usize].size, 150);
+    }
+
+    #[test]
+    fn subtree_keeps_hard_link_whose_first_name_is_outside() {
+        let mut linked = rec(40, 36, "shared.dll", false, 64);
+        linked.extra_links = vec![(37, "elsewhere.dll".into()), (33, "shared.dll".into())];
+        let recs = vec![
+            rec(30, 5, "Users", true, 0),
+            rec(31, 30, "me", true, 0),
+            rec(33, 31, "docs", true, 0),
+            rec(36, 5, "Windows", true, 0),
+            rec(37, 5, "Other", true, 0),
+            linked,
+        ];
+        let t = build_tree(recs.clone(), r"C:\Users\me", &comps(&["Users", "me"])).unwrap();
+        assert_eq!(paths(&t), [r"C:\Users\me", r"C:\Users\me\docs", r"C:\Users\me\docs\shared.dll"]);
+        assert_eq!(t.nodes[t.root.0 as usize].size, 64);
+
+        let whole = build_tree(recs, "C:", &[]).unwrap();
+        assert_eq!(whole.nodes.iter().filter(|n| !n.is_dir).count(), 1);
+        assert!(paths(&whole).contains(&r"C:\Windows\shared.dll".to_string()));
     }
 
     #[test]
@@ -649,6 +681,17 @@ mod tests {
         let compressed = d.join("compressed.txt");
         fs::write(&compressed, b"dirstat ".repeat(256 * 1024)).unwrap();
         ok(Command::new("compact").arg("/c").arg(&compressed));
+        // A hard link whose other name lives outside the scanned folder (the walk counts it once, here).
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("original.bin"), vec![4u8; 20_000]).unwrap();
+        fs::hard_link(outside.path().join("original.bin"), d.join("linked_from_outside.bin")).unwrap();
+        // WOF (compact /exe) compression: its MFT-mode size is otherwise unverified.
+        let wof = d.join("wof.txt");
+        fs::write(&wof, b"dirstat wof ".repeat(32 * 1024)).unwrap();
+        let wof_ok = Command::new("compact").args(["/c", "/exe:xpress8k"]).arg(&wof).output().is_ok_and(|o| o.status.success());
+        if !wof_ok {
+            println!("note: compact /exe:xpress8k failed, so the WOF file is uncompressed in this run");
+        }
         flush_volume();
 
         let (walked, skipped) = walk(d, &AtomicBool::new(false), &mut |_, _| {});

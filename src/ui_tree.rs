@@ -3,7 +3,7 @@
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Shape, Stroke, TextStyle, Vec2};
 use crate::app::{has_menu, AppState};
 use crate::model::{NodeId, Tree};
-use crate::ui_legend::color_for;
+use crate::theme::{palette, swatch};
 use std::collections::HashSet;
 
 const INDENT: f32 = 16.0;
@@ -15,7 +15,6 @@ const COLUMNS: [(&str, f32); 7] =
     [("Folder", 0.0), ("% of Parent", 100.0), ("Size", 80.0), ("Allocated", 80.0), ("Items", 80.0), ("Files", 80.0), ("Folders", 70.0)];
 /// The tree is ordered by size on disk, the Allocated column.
 const SORTED: usize = 3;
-const DIR_ICON: Color32 = Color32::from_rgb(230, 190, 60);
 
 enum Click {
     Select(NodeId),
@@ -32,6 +31,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
     let expanded = &state.expanded;
     let row_h = row_height(ui);
     let widths = COLUMNS.map(|(_, w)| w);
+    let dark = ui.visuals().dark_mode;
     let mut click = None;
     let mut menu = None;
 
@@ -62,7 +62,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
                 }
                 let mid = rect.center().y;
                 let icon = Rect::from_center_size(Pos2::new(arrow_rect.right() + ICON_W / 2.0, mid), Vec2::new(12.0, 10.0));
-                painter.with_clip_rect(cells[0]).rect_filled(icon, 1.0, if node.is_dir { DIR_ICON } else { color_for(node.ext) });
+                painter.with_clip_rect(cells[0]).rect_filled(icon, 0.0, if node.is_dir { palette(dark).muted } else { swatch(dark, node.ext) });
                 let name_pos = Pos2::new(arrow_rect.right() + ICON_W + CELL_PAD, mid);
                 painter.with_clip_rect(cells[0]).text(name_pos, Align2::LEFT_CENTER, &node.name, FontId::default(), color);
                 share_bar(ui, painter, cells[1], tree.percent_of_parent(id));
@@ -110,7 +110,7 @@ pub(crate) fn placeholder(ui: &mut egui::Ui, state: &AppState) {
         ui.label("Scanning…");
     }
     if let Some(error) = &state.error {
-        ui.colored_label(Color32::RED, error);
+        ui.colored_label(palette(ui.visuals().dark_mode).error, error);
     }
 }
 
@@ -195,7 +195,7 @@ pub(crate) fn header(ui: &mut egui::Ui, row_h: f32, columns: &[(&str, f32)], fle
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), row_h), Sense::hover());
     let widths: Vec<f32> = columns.iter().map(|&(_, w)| w).collect();
     let cells = cells(rect, &widths, flex);
-    let color = ui.visuals().strong_text_color();
+    let color = palette(ui.visuals().dark_mode).header;
     let painter = ui.painter();
     painter.rect_filled(rect, 0.0, ui.visuals().faint_bg_color);
     for (i, (cell, (title, _))) in cells.iter().zip(columns).enumerate() {
@@ -211,7 +211,7 @@ pub(crate) fn header(ui: &mut egui::Ui, row_h: f32, columns: &[(&str, f32)], fle
 pub(crate) fn row_background(ui: &egui::Ui, row: Rect, cells: &[Rect], index: usize, selected: bool) {
     let painter = ui.painter();
     if selected {
-        painter.rect_filled(row, 0.0, ui.visuals().selection.bg_fill);
+        painter.rect_filled(row, 0.0, palette(ui.visuals().dark_mode).selected);
     } else if index % 2 == 1 {
         painter.rect_filled(row, 0.0, ui.visuals().faint_bg_color);
     }
@@ -221,7 +221,7 @@ pub(crate) fn row_background(ui: &egui::Ui, row: Rect, cells: &[Rect], index: us
 }
 
 fn grid_line(ui: &egui::Ui, painter: &egui::Painter, cell: Rect) {
-    let stroke = Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color);
+    let stroke = Stroke::new(1.0, palette(ui.visuals().dark_mode).rule);
     painter.vline(cell.right() - 0.5, cell.y_range(), stroke);
 }
 
@@ -234,9 +234,10 @@ pub(crate) fn text(painter: &egui::Painter, cell: Rect, s: &str, align: Align2, 
 /// A bar filled to `percent` of the cell, with the number over it.
 pub(crate) fn share_bar(ui: &egui::Ui, painter: &egui::Painter, cell: Rect, percent: f32) {
     let bar = cell.shrink2(Vec2::new(CELL_PAD, 2.0));
-    painter.rect_filled(bar, 0.0, ui.visuals().extreme_bg_color);
+    let pal = palette(ui.visuals().dark_mode);
+    painter.rect_filled(bar, 0.0, pal.rule);
     let filled = (percent / 100.0).clamp(0.0, 1.0);
-    painter.rect_filled(Rect::from_min_size(bar.min, Vec2::new(bar.width() * filled, bar.height())), 0.0, Color32::from_gray(95));
+    painter.rect_filled(Rect::from_min_size(bar.min, Vec2::new(bar.width() * filled, bar.height())), 0.0, pal.accent);
     text(painter, cell, &format!("{percent:.1} %"), Align2::RIGHT_CENTER, ui.visuals().text_color());
 }
 

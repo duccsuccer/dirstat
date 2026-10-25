@@ -236,7 +236,7 @@ unsafe extern "system" fn forward_menu_messages(hwnd: HWND, msg: u32, wparam: WP
 }
 
 /// The system's "app mode" setting (Settings > Personalization > Colors): 0 dark, 1 light; `None` when unset.
-fn apps_use_light_theme() -> Option<u32> {
+pub(crate) fn apps_use_light_theme() -> Option<u32> {
     let mut value = 0u32;
     let mut size = size_of::<u32>() as u32;
     unsafe {

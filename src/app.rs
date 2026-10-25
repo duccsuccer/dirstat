@@ -4,6 +4,7 @@ use eframe::egui;
 use crate::actions::{self, AppItem, Chosen, Entry};
 use crate::model::{NodeId, Tree};
 use crate::scan::{self, ScanEvent, ScanHandle, ScanMode, ScanTarget};
+use crate::theme::{self, palette};
 use crate::{ui_legend, ui_tree, ui_treemap::{self, is_within, TreemapCache}};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -39,6 +40,8 @@ pub struct AppState {
     pub scan_secs: Option<f32>,
     /// File type names the shell gave for each extension, so it is asked once per extension.
     pub type_names: HashMap<String, String>,
+    /// The system theme and window focus at the last frame; the Windows app mode is read again when either changes.
+    pub theme_key: Option<(Option<egui::Theme>, bool)>,
 }
 
 impl Default for AppState {
@@ -70,6 +73,7 @@ impl AppState {
             scan_started: None,
             scan_secs: None,
             type_names: HashMap::new(),
+            theme_key: None,
         }
     }
 
@@ -229,6 +233,11 @@ impl eframe::App for AppState {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let key = (ui.ctx().system_theme(), ui.input(|i| i.focused));
+        if self.theme_key != Some(key) {
+            self.theme_key = Some(key);
+            theme::apply(ui.ctx());
+        }
         if let Some((id, extended)) = self.pending_menu.take() {
             self.context_menu(id, extended);
         }
@@ -290,20 +299,6 @@ fn exists(path: &Path) -> bool {
     !matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
 }
 
-/// Dark, compact look: near-black panels, faint row stripes, blue selection.
-pub fn apply_theme(ctx: &egui::Context) {
-    ctx.set_theme(egui::Theme::Dark);
-    ctx.style_mut_of(egui::Theme::Dark, |style| {
-        let visuals = &mut style.visuals;
-        visuals.panel_fill = egui::Color32::from_gray(24);
-        visuals.window_fill = egui::Color32::from_gray(30);
-        visuals.extreme_bg_color = egui::Color32::from_gray(14);
-        visuals.faint_bg_color = egui::Color32::from_gray(32);
-        visuals.selection.bg_fill = egui::Color32::from_rgb(0, 90, 158);
-        visuals.widgets.noninteractive.bg_stroke.color = egui::Color32::from_gray(48);
-    });
-}
-
 /// Width of the top bar's left block: drive picker, buttons, status and progress bar.
 const CONTROLS_W: f32 = 420.0;
 
@@ -357,7 +352,7 @@ fn top_bar(ui: &mut egui::Ui, state: &mut AppState) {
     });
     ui.data_mut(|d| d.insert_temp(drive_id, choice));
     if let Some(error) = &state.error {
-        ui.colored_label(egui::Color32::RED, error);
+        ui.colored_label(palette(ui.visuals().dark_mode).error, error);
     }
 }
 
@@ -619,6 +614,7 @@ mod tests {
             dirs: Vec::new(),
             highlight_for: None,
             highlight: Default::default(),
+            dark: false,
         });
         state.forget_if_gone(f, |_| false);
         let tree = state.tree.as_ref().unwrap();
@@ -739,6 +735,7 @@ mod tests {
             dirs: Vec::new(),
             highlight_for: None,
             highlight: Default::default(),
+            dark: false,
         });
         state.app_item(f, AppItem::ZoomIn);
         assert_eq!(state.treemap_root, a);

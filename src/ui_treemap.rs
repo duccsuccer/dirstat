@@ -5,7 +5,7 @@ use eframe::egui::text::{LayoutJob, TextWrapping};
 use crate::app::{has_menu, AppState};
 use crate::model::{NodeId, Tree};
 use crate::treemap;
-use crate::ui_legend::color_for;
+use crate::theme::{palette, swatch};
 use crate::actions::shell_path;
 use crate::ui_tree::{ensure_visible, format_size, placeholder};
 use std::sync::Arc;
@@ -18,10 +18,6 @@ const LABEL_PAD: f32 = 3.0;
 const LABEL_MIN_W: f32 = 10.0;
 /// Height of the name strip at the top of a large folder, in points.
 const HEADER_H: f32 = 14.0;
-/// Folder background, also shown where items too small to draw are.
-const DIR_FILL: Color32 = Color32::from_gray(52);
-/// The 1px lines between neighbouring rects.
-const BORDER: Color32 = Color32::from_gray(20);
 
 /// Layout of the pane at one size. The layout is in physical pixels, so every edge and border line lands on a
 /// whole pixel; both meshes are in absolute screen points, placed at `origin`. `highlight` outlines the selection
@@ -36,23 +32,26 @@ pub struct TreemapCache {
     pub origin: Pos2,
     pub highlight_for: Option<NodeId>,
     pub highlight: Arc<Mesh>,
+    /// The look the mesh was coloured for; a change of app mode lays the pane out again.
+    pub dark: bool,
 }
 
 impl TreemapCache {
     /// Lays out the folder `root` and below it; `size` in physical pixels, `ppp` pixels per point.
-    fn new(tree: &Tree, root: NodeId, size: (f32, f32), ppp: f32) -> Self {
+    fn new(tree: &Tree, root: NodeId, size: (f32, f32), ppp: f32, dark: bool) -> Self {
+        let p = palette(dark);
         let bounds = treemap::Rect { x: 0.0, y: 0.0, w: size.0.floor(), h: size.1.floor() };
         let (blocks, dirs) = treemap::layout_with_headers(tree, root, bounds, header_px(ppp));
         // Paint order: the border colour under everything, then folders (parents first), then files. Each rect leaves
         // its right and bottom pixel unpainted, which shows as a 1px line between neighbours. Labels and the
         // selection outline are drawn over this mesh.
         let mut mesh = Mesh::default();
-        mesh.add_colored_rect(to_egui(&bounds, Pos2::ZERO, ppp), BORDER);
+        mesh.add_colored_rect(to_egui(&bounds, Pos2::ZERO, ppp), p.bg);
         for (_, d) in &dirs {
-            mesh.add_colored_rect(to_egui(&inner(d), Pos2::ZERO, ppp), DIR_FILL);
+            mesh.add_colored_rect(to_egui(&inner(d), Pos2::ZERO, ppp), p.neutral);
         }
         for (id, b) in &blocks {
-            add_shaded_rect(&mut mesh, to_egui(&inner(b), Pos2::ZERO, ppp), color_for(tree.nodes[id.0 as usize].ext));
+            add_shaded_rect(&mut mesh, to_egui(&inner(b), Pos2::ZERO, ppp), swatch(dark, tree.nodes[id.0 as usize].ext));
         }
         Self {
             size,
@@ -62,6 +61,7 @@ impl TreemapCache {
             origin: Pos2::ZERO,
             highlight_for: None,
             highlight: Arc::new(Mesh::default()),
+            dark,
         }
     }
 
@@ -82,6 +82,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
         return;
     };
     let root = state.treemap_root;
+    let dark = ui.visuals().dark_mode;
     ui.vertical_centered(|ui| ui.strong(shell_path(tree.path(root))));
     let size = ui.available_size();
     let (response, painter) = ui.allocate_painter(size, Sense::click());
@@ -90,10 +91,10 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
 
     // In pixels, so a change of display scale also lays the pane out again.
     let size = (size.x * ppp, size.y * ppp);
-    if needs_relayout(state.treemap_cache.as_ref().map(|c| c.size), size) {
+    if needs_relayout(state.treemap_cache.as_ref().map(|c| c.size), size) || state.treemap_cache.as_ref().is_some_and(|c| c.dark != dark) {
         state.treemap_cache = None;
     }
-    let cache = state.treemap_cache.get_or_insert_with(|| TreemapCache::new(tree, root, size, ppp));
+    let cache = state.treemap_cache.get_or_insert_with(|| TreemapCache::new(tree, root, size, ppp, dark));
     cache.place(origin);
     if cache.highlight_for != state.selected {
         // A framed folder is outlined as one box, anything else block by block.
@@ -101,7 +102,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
             Some(&(_, r)) => vec![r],
             None => blocks_under(tree, &cache.blocks, id),
         });
-        cache.highlight = Arc::new(outline_mesh(&highlight_outline_rects(&rects), origin, ppp));
+        cache.highlight = Arc::new(outline_mesh(&highlight_outline_rects(&rects), origin, ppp, palette(dark).text));
         cache.highlight_for = state.selected;
     }
 
@@ -116,7 +117,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
         if text_w < LABEL_MIN_W {
             continue;
         }
-        let color = Color32::from_gray(225);
+        let color = palette(dark).text;
         let text = format!("{} ({})", node.name, format_size(node.size));
         let mut job = LayoutJob::simple_singleline(text, FontId::proportional(11.0), color);
         job.wrap = TextWrapping::truncate_at_width(text_w);
@@ -208,8 +209,8 @@ fn add_shaded_rect(mesh: &mut Mesh, r: egui::Rect, color: Color32) {
     mesh.add_triangle(i + 1, i + 3, i + 2);
 }
 
-/// Four thin white edges per rect (in pixels), in absolute screen points for a pane at `origin`.
-fn outline_mesh(rects: &[treemap::Rect], origin: Pos2, ppp: f32) -> Mesh {
+/// Four thin edges per rect (in pixels) in `color`, in absolute screen points for a pane at `origin`.
+fn outline_mesh(rects: &[treemap::Rect], origin: Pos2, ppp: f32, color: Color32) -> Mesh {
     let mut mesh = Mesh::default();
     for r in rects {
         let egui::Rect { min, max } = to_egui(r, origin, ppp);
@@ -220,7 +221,7 @@ fn outline_mesh(rects: &[treemap::Rect], origin: Pos2, ppp: f32) -> Mesh {
             egui::Rect::from_min_max(min, Pos2::new(min.x + t, max.y)),
             egui::Rect::from_min_max(Pos2::new(max.x - t, min.y), max),
         ] {
-            mesh.add_colored_rect(edge, Color32::WHITE);
+            mesh.add_colored_rect(edge, color);
         }
     }
     mesh

@@ -463,7 +463,7 @@ fn disk_fields(disk: Option<(u64, u64)>) -> [(&'static str, String); 3] {
 }
 
 /// Item `id`'s items, files and folders as the tree counts them (a file is one item and one file).
-fn counts(tree: &Tree, id: NodeId) -> (u64, u64, u64) {
+pub(crate) fn counts(tree: &Tree, id: NodeId) -> (u64, u64, u64) {
     let node = &tree.nodes[id.0 as usize];
     if node.is_dir {
         let (files, folders) = (u64::from(node.files), u64::from(node.folders));

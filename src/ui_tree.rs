@@ -1,7 +1,7 @@
 //! Directory tree pane (top-left), and the table drawing it shares with the file-type pane.
 
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, TextStyle, Vec2};
-use crate::app::{has_menu, AppState};
+use crate::app::{counts, has_menu, AppState};
 use crate::model::{NodeId, Tree};
 use crate::theme::{palette, swatch};
 use std::collections::HashSet;
@@ -10,8 +10,18 @@ const INDENT: f32 = 16.0;
 const ARROW_W: f32 = 16.0;
 const ICON_W: f32 = 16.0;
 const CELL_PAD: f32 = 4.0;
-/// Title and width of each column; the first takes the width the others leave.
-const COLUMNS: [(&str, f32); 5] = [("Folder", 0.0), ("Share", 100.0), ("Size", 80.0), ("Allocated", 80.0), ("Files", 80.0)];
+/// Title and width of each column; the first takes the width the others leave, but never less than `FOLDER_MIN_W`.
+/// When the pane is too narrow, the columns at the right go first.
+const COLUMNS: [(&str, f32); 7] = [
+    ("Folder", 0.0),
+    ("Share", 100.0),
+    ("Size", 80.0),
+    ("Allocated", 80.0),
+    ("Files", 80.0),
+    ("Items", 80.0),
+    ("Folders", 80.0),
+];
+const FOLDER_MIN_W: f32 = 200.0;
 
 enum Click {
     Select(NodeId),
@@ -28,11 +38,12 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
     let expanded = &state.expanded;
     let row_h = row_height(ui);
     let widths = COLUMNS.map(|(_, w)| w);
+    let shown = columns_that_fit(ui.available_width(), &widths, FOLDER_MIN_W);
     let dark = ui.visuals().dark_mode;
     let mut click = None;
     let mut menu = None;
 
-    header(ui, row_h, &COLUMNS, 0);
+    header(ui, row_h, &COLUMNS[..shown], 0);
     let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]);
     if state.scroll_to_selected {
         state.scroll_to_selected = false;
@@ -45,7 +56,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
                 let node = &tree.nodes[id.0 as usize];
                 let expandable = node.is_dir && !node.children.is_empty();
                 let (rect, response) = ui.allocate_exact_size(Vec2::new(ui.available_width(), row_h), Sense::click());
-                let cells = cells(rect, &widths, 0);
+                let cells = cells(rect, &widths[..shown], 0);
                 let arrow_rect = Rect::from_min_size(
                     Pos2::new(cells[0].left() + depth as f32 * INDENT, rect.top()),
                     Vec2::new(ARROW_W, row_h),
@@ -63,11 +74,22 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
                 painter.with_clip_rect(cells[0]).rect_filled(icon, 0.0, if node.is_dir { palette(dark).muted } else { swatch(dark, node.ext) });
                 let name_pos = Pos2::new(arrow_rect.right() + ICON_W + CELL_PAD, mid);
                 painter.with_clip_rect(cells[0]).text(name_pos, Align2::LEFT_CENTER, &node.name, FontId::default(), color);
-                share_bar(ui, painter, cells[1], tree.percent_of_parent(id));
-                text(painter, cells[2], &format_size(node.logical), Align2::RIGHT_CENTER, color);
-                text(painter, cells[3], &format_size(node.size), Align2::RIGHT_CENTER, color);
+                // A column the pane is too narrow for is not in `cells`, so it is skipped.
+                if let Some(&cell) = cells.get(1) {
+                    share_bar(ui, painter, cell, tree.percent_of_parent(id));
+                }
+                let right = |i: usize, value: String| {
+                    if let Some(&cell) = cells.get(i) {
+                        text(painter, cell, &value, Align2::RIGHT_CENTER, color);
+                    }
+                };
+                right(2, format_size(node.logical));
+                right(3, format_size(node.size));
                 if node.is_dir {
-                    text(painter, cells[4], &format_count(u64::from(node.files)), Align2::RIGHT_CENTER, color);
+                    let (items, files, folders) = counts(tree, id);
+                    right(4, format_count(files));
+                    right(5, format_count(items));
+                    right(6, format_count(folders));
                 }
 
                 if response.clicked() {
@@ -167,6 +189,21 @@ pub(crate) fn row_height(ui: &mut egui::Ui) -> f32 {
     // Rows sit edge to edge so the striping has no gaps.
     ui.spacing_mut().item_spacing.y = 0.0;
     ui.text_style_height(&TextStyle::Body) + 10.0
+}
+
+/// How many leading columns fit in `available` points: column 0 (the flex one) always, then each further column
+/// while the fixed widths so far plus `flex_min` still fit.
+pub(crate) fn columns_that_fit(available: f32, widths: &[f32], flex_min: f32) -> usize {
+    let mut fixed = 0.0;
+    let mut shown = 1;
+    for &w in &widths[1..] {
+        if fixed + w + flex_min > available {
+            break;
+        }
+        fixed += w;
+        shown += 1;
+    }
+    shown
 }
 
 /// Splits `row` into one cell per width; column `flex` takes whatever the other widths leave.
@@ -339,6 +376,16 @@ mod tests {
         // Too narrow: the flex column shrinks to nothing, never below.
         let c = cells(row, &[0.0, 400.0], 0);
         assert_eq!(c[0].width(), 0.0);
+    }
+
+    #[test]
+    fn columns_drop_from_the_right_as_the_pane_narrows() {
+        let widths = COLUMNS.map(|(_, w)| w);
+        // Default window 1400 wide, and 1100 wide, with the 420 point file-type pane and 8 point margins.
+        assert_eq!(columns_that_fit(1400.0 - 420.0 - 16.0, &widths, FOLDER_MIN_W), 7);
+        assert_eq!(columns_that_fit(1100.0 - 420.0 - 16.0, &widths, FOLDER_MIN_W), 6, "Folders is the first to go");
+        assert_eq!(columns_that_fit(300.0, &widths, FOLDER_MIN_W), 2);
+        assert_eq!(columns_that_fit(150.0, &widths, FOLDER_MIN_W), 1, "the folder column is always there");
     }
 
     #[test]

@@ -238,15 +238,26 @@ fn top_bar(ui: &mut egui::Ui, state: &mut AppState) {
                 ScanMode::Walk => "Fallback (walk)",
             });
         }
+        if let Some(text) = skipped_label(state) {
+            ui.label(text);
+        }
         if state.scan.is_some() {
-            let (files, bytes) = state.progress;
-            ui.label(format!("Scanning: {files} files, {bytes} bytes"));
+            ui.label(progress_label(state.progress));
         }
     });
     ui.data_mut(|d| d.insert_temp(drive_id, choice));
     if let Some(error) = &state.error {
         ui.colored_label(egui::Color32::RED, error);
     }
+}
+
+/// Tells the user the totals miss what the walk could not read; only once a tree is shown.
+fn skipped_label(state: &AppState) -> Option<String> {
+    (state.tree.is_some() && state.skipped > 0).then(|| format!("{} items could not be read", state.skipped))
+}
+
+fn progress_label((files, bytes): (u64, u64)) -> String {
+    format!("Scanning: {files} files, {}", ui_tree::format_size(bytes))
 }
 
 /// Drive letters the system reports as present (GetLogicalDriveStringsW lists only existing drives).
@@ -416,6 +427,22 @@ mod tests {
         state.pump();
         assert_eq!(state.error.as_deref(), Some("cannot read C:\\"));
         assert!(state.scan.is_none());
+    }
+
+    #[test]
+    fn skipped_items_are_shown_with_the_tree() {
+        let mut state = AppState::new();
+        state.skipped = 3;
+        assert_eq!(skipped_label(&state), None);
+        state.tree = Some(tree());
+        assert_eq!(skipped_label(&state).as_deref(), Some("3 items could not be read"));
+        state.skipped = 0;
+        assert_eq!(skipped_label(&state), None);
+    }
+
+    #[test]
+    fn progress_label_formats_bytes() {
+        assert_eq!(progress_label((12, 1536)), "Scanning: 12 files, 1.5 KB");
     }
 
     #[test]

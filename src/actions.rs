@@ -53,7 +53,9 @@ pub fn recycle(path: &Path, size: u64) -> DeleteOutcome {
     //    b. The bin's own settings (`bin_settings`): refused when the volume's NukeOnDelete is on, when the
     //       NoRecycleFiles policy is set, or when `size` reaches the bin's maximum (MaxCapacity, or a
     //       RecycleBinSize policy). These are the causes of "too big to recycle" and "delete permanently".
-    //       A setting that exists but cannot be read counts as "refuse".
+    //       A setting that exists but cannot be read counts as "refuse": an unreadable NukeOnDelete,
+    //       NoRecycleFiles, MaxCapacity or RecycleBinSize value, or a RecycleBinSize policy when the drive's
+    //       size cannot be read. A value that is missing means the default.
     // 2. Flags: FOF_ALLOWUNDO | FOFX_RECYCLEONDELETE ask for the Recycle Bin. FOF_NOCONFIRMATION is deliberately
     //    NOT set (it answers "Yes to All", which is how SHFileOperation callers silently nuke too-large files), and
     //    FOF_WANTNUKEWARNING asks the shell to warn before destroying instead of recycling. The docs do not say
@@ -80,8 +82,10 @@ pub fn recycle(path: &Path, size: u64) -> DeleteOutcome {
 pub(crate) struct BinSettings {
     pub nuke_on_delete: bool,
     pub policy_no_recycle: bool,
-    /// `None` when the limit cannot be determined; it is then not guessed.
+    /// `None` when no limit is set (the default percentage is not guessed).
     pub max_capacity_bytes: Option<u64>,
+    /// What could not be read when a limit exists but its size is unknown; such a bin refuses everything.
+    pub unreadable_limit: Option<&'static str>,
 }
 
 /// Why the bin would not take an item of `size` bytes; `None` when these settings allow it.
@@ -90,6 +94,8 @@ pub(crate) fn bin_refusal(bin: &BinSettings, size: u64) -> Option<String> {
         Some("Not deleted: a policy turns the Recycle Bin off, and this app never deletes permanently.".into())
     } else if bin.nuke_on_delete {
         Some("Not deleted: the Recycle Bin is set to remove files immediately on this drive, and this app never deletes permanently.".into())
+    } else if let Some(what) = bin.unreadable_limit {
+        Some(format!("Not deleted: cannot read {what}, and this app never deletes permanently."))
     } else if bin.max_capacity_bytes.is_some_and(|max| size >= max) {
         Some("Not deleted: it is too large for this drive's Recycle Bin, and this app never deletes permanently.".into())
     } else {
@@ -100,6 +106,26 @@ pub(crate) fn bin_refusal(bin: &BinSettings, size: u64) -> Option<String> {
 /// A switch read from the registry: a missing value is the default (off); a value that cannot be read counts as on.
 pub(crate) fn flag_is_set(read: Result<Option<u32>, ()>) -> bool {
     !matches!(read, Ok(None | Some(0)))
+}
+
+/// The bin's size limit in bytes from MaxCapacity (MB) and the RecycleBinSize policies (percent of the
+/// `volume_bytes` volume); the smallest wins. `Ok(None)` when none is set. `Err` names what could not be read
+/// when a limit exists but its size is unknown.
+pub(crate) fn size_limit(
+    max_capacity_mb: Result<Option<u32>, ()>,
+    percent_policies: &[Result<Option<u32>, ()>],
+    volume_bytes: Option<u64>,
+) -> Result<Option<u64>, &'static str> {
+    const UNREADABLE: &str = "this drive's Recycle Bin limit";
+    let mut limit = max_capacity_mb.map_err(|()| UNREADABLE)?.map(|mb| u64::from(mb) * 1024 * 1024);
+    for percent in percent_policies {
+        if let Some(percent) = percent.map_err(|()| UNREADABLE)? {
+            let total = volume_bytes.ok_or("this drive's size, which its Recycle Bin size policy needs")?;
+            let bytes = total / 100 * u64::from(percent.min(100));
+            limit = Some(limit.map_or(bytes, |l| l.min(bytes)));
+        }
+    }
+    Ok(limit)
 }
 
 const POLICIES_EXPLORER: &str = r"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer";
@@ -120,16 +146,14 @@ fn bin_settings(root: PCWSTR) -> BinSettings {
     let per_volume = |value: &str| volume_key.as_deref().map_or(Err(()), |key| read_dword(HKEY_CURRENT_USER, key, value));
     let policy = |value: &str| [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE].map(|hive| read_dword(hive, POLICIES_EXPLORER, value));
 
-    let percent_limit = policy("RecycleBinSize").into_iter().flatten().flatten().filter_map(|percent| {
-        let mut total = 0u64;
-        unsafe { GetDiskFreeSpaceExW(root, None, Some(&mut total), None) }.ok()?;
-        Some(total / 100 * u64::from(percent.min(100)))
-    });
-    let capacity_limit = per_volume("MaxCapacity").ok().flatten().map(|mb| u64::from(mb) * 1024 * 1024);
+    let mut total = 0u64;
+    let volume_bytes = unsafe { GetDiskFreeSpaceExW(root, None, Some(&mut total), None) }.ok().map(|()| total);
+    let limit = size_limit(per_volume("MaxCapacity"), &policy("RecycleBinSize"), volume_bytes);
     BinSettings {
         nuke_on_delete: flag_is_set(per_volume("NukeOnDelete")),
         policy_no_recycle: policy("NoRecycleFiles").into_iter().any(flag_is_set),
-        max_capacity_bytes: capacity_limit.into_iter().chain(percent_limit).min(),
+        max_capacity_bytes: limit.unwrap_or(None),
+        unreadable_limit: limit.err(),
     }
 }
 
@@ -371,6 +395,35 @@ mod tests {
     fn unknown_max_is_not_guessed() {
         let bin = BinSettings::default();
         assert_eq!(bin_refusal(&bin, u64::MAX), None);
+    }
+
+    #[test]
+    fn unreadable_limit_is_refused() {
+        let bin = BinSettings { unreadable_limit: Some("this drive's Recycle Bin limit"), ..Default::default() };
+        let reason = bin_refusal(&bin, 1).unwrap();
+        assert!(reason.contains("cannot read this drive's Recycle Bin limit"), "{reason}");
+    }
+
+    #[test]
+    fn size_limit_from_each_setting() {
+        let none = [Ok(None), Ok(None)];
+        // Missing everywhere: the default limit is not guessed.
+        assert_eq!(size_limit(Ok(None), &none, None), Ok(None));
+        assert_eq!(size_limit(Ok(Some(10)), &none, None), Ok(Some(10 * MB)));
+        // A policy percent of the volume; the smallest limit wins.
+        assert_eq!(size_limit(Ok(None), &[Ok(Some(5)), Ok(None)], Some(100_000)), Ok(Some(5_000)));
+        assert_eq!(size_limit(Ok(Some(1)), &[Ok(None), Ok(Some(50))], Some(100 * MB)), Ok(Some(MB)));
+    }
+
+    #[test]
+    fn size_limit_that_exists_but_cannot_be_read_is_err() {
+        let none = [Ok(None), Ok(None)];
+        let limit = Err("this drive's Recycle Bin limit");
+        assert_eq!(size_limit(Err(()), &none, Some(MB)), limit);
+        assert_eq!(size_limit(Ok(Some(10)), &[Ok(None), Err(())], Some(MB)), limit);
+        let disk = size_limit(Ok(Some(10)), &[Ok(Some(5)), Ok(None)], None);
+        assert!(disk.is_err_and(|what| what.contains("size")), "{disk:?}");
+        assert_ne!(disk, limit);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Directory tree pane (top-left), and the table drawing it shares with the file-type pane.
 
-use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Shape, Stroke, TextStyle, Vec2};
+use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, TextStyle, Vec2};
 use crate::app::{has_menu, AppState};
 use crate::model::{NodeId, Tree};
 use crate::theme::{palette, swatch};
@@ -55,7 +55,8 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
 
                 row_background(ui, rect, selected == Some(id));
                 if expandable {
-                    arrow(painter, arrow_rect.center(), expanded.contains(&id), color);
+                    let tint = if response.hovered() { palette(dark).text } else { palette(dark).muted };
+                    chevron(painter, arrow_rect, expanded.contains(&id), tint);
                 }
                 let mid = rect.center().y;
                 let icon = Rect::from_center_size(Pos2::new(arrow_rect.right() + ICON_W / 2.0, mid), Vec2::new(12.0, 10.0));
@@ -225,14 +226,28 @@ pub(crate) fn share_bar(ui: &egui::Ui, painter: &egui::Painter, cell: Rect, perc
     painter.rect_filled(Rect::from_min_size(track.min, Vec2::new(track.width() * filled, 3.0)), 0.0, pal.accent);
 }
 
-/// Expander triangle: pointing right when collapsed, down when open.
-fn arrow(painter: &egui::Painter, center: Pos2, open: bool, color: Color32) {
-    let points = if open {
-        vec![center + Vec2::new(-4.0, -2.5), center + Vec2::new(4.0, -2.5), center + Vec2::new(0.0, 2.5)]
+/// The two arms of the expander chevron centred in `r`: pointing down when `open`, right when collapsed.
+pub(crate) fn chevron_arms(r: Rect, open: bool) -> [[Pos2; 2]; 2] {
+    const H: f32 = 3.5;
+    let c = r.center();
+    if open {
+        [
+            [c + Vec2::new(-H, -H / 2.0), c + Vec2::new(0.0, H / 2.0)],
+            [c + Vec2::new(0.0, H / 2.0), c + Vec2::new(H, -H / 2.0)],
+        ]
     } else {
-        vec![center + Vec2::new(-2.5, -4.0), center + Vec2::new(-2.5, 4.0), center + Vec2::new(2.5, 0.0)]
-    };
-    painter.add(Shape::convex_polygon(points, color, Stroke::NONE));
+        [
+            [c + Vec2::new(-H / 2.0, -H), c + Vec2::new(H / 2.0, 0.0)],
+            [c + Vec2::new(H / 2.0, 0.0), c + Vec2::new(-H / 2.0, H)],
+        ]
+    }
+}
+
+/// Expander chevron as two thin lines, drawn rather than set in a font.
+fn chevron(painter: &egui::Painter, r: Rect, open: bool, color: Color32) {
+    for [a, b] in chevron_arms(r, open) {
+        painter.line_segment([a, b], Stroke::new(1.4, color));
+    }
 }
 
 #[cfg(test)]
@@ -323,6 +338,34 @@ mod tests {
         // Too narrow: the flex column shrinks to nothing, never below.
         let c = cells(row, &[0.0, 400.0], 0);
         assert_eq!(c[0].width(), 0.0);
+    }
+
+    #[test]
+    fn chevron_points_down_when_open_and_right_when_closed() {
+        let r = Rect::from_min_size(Pos2::new(10.0, 20.0), Vec2::new(16.0, 22.0));
+        let c = r.center();
+        let [down_a, down_b] = chevron_arms(r, true);
+        // Both arms meet at one tip below the centre, and start above it.
+        assert_eq!(down_a[1], down_b[0]);
+        assert!(down_b[0].y > c.y);
+        assert!(down_a[0].y < c.y && down_a[0].x < c.x && down_b[1].x > c.x);
+        let [right_a, right_b] = chevron_arms(r, false);
+        // The tip is right of the centre; the arms start at the left.
+        assert_eq!(right_a[1], right_b[0]);
+        assert!(right_b[0].x > c.x);
+        assert!(right_a[0].x < c.x && right_b[1].x < c.x);
+    }
+
+    #[test]
+    fn chevron_stays_inside_its_hit_target() {
+        let r = Rect::from_min_size(Pos2::ZERO, Vec2::new(16.0, 16.0));
+        for open in [false, true] {
+            for [a, b] in chevron_arms(r, open) {
+                for p in [a, b] {
+                    assert!(r.contains(p), "{p:?} outside {r:?}");
+                }
+            }
+        }
     }
 
     #[test]

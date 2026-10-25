@@ -1,8 +1,10 @@
-//! File actions on one item: open in Explorer, copy its path, delete it to the Recycle Bin.
+//! File actions on one item: open in Explorer, copy its path, delete it to the Recycle Bin or, when the user
+//! explicitly asks, permanently.
 
 use std::cell::Cell;
 use std::ffi::c_void;
 use std::io::ErrorKind;
+use std::os::windows::fs::FileTypeExt;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -64,8 +66,39 @@ pub fn copy_path(path: &str) -> Result<(), String> {
 #[derive(Debug, PartialEq)]
 pub enum DeleteOutcome {
     Recycled,
+    /// Removed for good by `delete_permanently`.
+    Deleted,
     Refused(String),
     Failed(String),
+}
+
+/// Ends every message that refuses a recycle: the user may choose the explicit permanent delete instead.
+const PERMANENT_HINT: &str = "To remove it without the Recycle Bin, use Delete permanently.";
+
+/// Deletes `path` for good, without the Recycle Bin; only for an explicit, confirmed "Delete permanently".
+/// A symlink or junction is removed itself: nothing behind it is followed or touched, also inside a folder
+/// (`remove_dir_all` does not follow links). Drive roots and paths that are not absolute are refused.
+pub fn delete_permanently(path: &Path) -> DeleteOutcome {
+    let shown = path.display();
+    if !path.is_absolute() || path.parent().is_none() {
+        return DeleteOutcome::Refused(format!("Not deleted: {shown} is a drive root or not a full path."));
+    }
+    let kind = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta.file_type(),
+        Err(e) => return DeleteOutcome::Failed(format!("Could not delete {shown}: {e}")),
+    };
+    let removed = if kind.is_symlink_dir() {
+        std::fs::remove_dir(path)
+    } else if kind.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    };
+    match (removed, std::fs::symlink_metadata(path)) {
+        (Err(e), _) => DeleteOutcome::Failed(format!("Could not delete {shown}: {e}")),
+        (Ok(()), Err(e)) if e.kind() == ErrorKind::NotFound => DeleteOutcome::Deleted,
+        (Ok(()), _) => DeleteOutcome::Failed(format!("{shown}: the delete reported success but the item still exists.")),
+    }
 }
 
 /// Moves `path` (`size` bytes) to the Recycle Bin. Never deletes permanently: anything that cannot be recycled
@@ -116,13 +149,13 @@ pub(crate) struct BinSettings {
 /// Why the bin would not take an item of `size` bytes; `None` when these settings allow it.
 pub(crate) fn bin_refusal(bin: &BinSettings, size: u64) -> Option<String> {
     if bin.policy_no_recycle {
-        Some("Not deleted: a policy turns the Recycle Bin off, and this app never deletes permanently.".into())
+        Some(format!("Not deleted: a policy turns the Recycle Bin off. {PERMANENT_HINT}"))
     } else if bin.nuke_on_delete {
-        Some("Not deleted: the Recycle Bin is set to remove files immediately on this drive, and this app never deletes permanently.".into())
+        Some(format!("Not deleted: the Recycle Bin is set to remove files immediately on this drive. {PERMANENT_HINT}"))
     } else if let Some(what) = bin.unreadable_limit {
-        Some(format!("Not deleted: cannot read {what}, and this app never deletes permanently."))
+        Some(format!("Not deleted: cannot read {what}, so recycling is not safe. {PERMANENT_HINT}"))
     } else if bin.max_capacity_bytes.is_some_and(|max| size >= max) {
-        Some("Not deleted: it is too large for this drive's Recycle Bin, and this app never deletes permanently.".into())
+        Some(format!("Not deleted: it is too large for this drive's Recycle Bin. {PERMANENT_HINT}"))
     } else {
         None
     }
@@ -213,7 +246,7 @@ pub(crate) fn drive_type_refusal(drive_type: u32) -> Option<String> {
         DRIVE_RAMDISK => "a RAM disk",
         _ => "a drive of unknown type",
     };
-    Some(format!("Not deleted: it is on {kind}, which has no Recycle Bin, and this app never deletes permanently."))
+    Some(format!("Not deleted: it is on {kind}, which has no Recycle Bin. {PERMANENT_HINT}"))
 }
 
 fn volume_refusal(path: &Path, size: u64) -> Option<String> {
@@ -228,7 +261,7 @@ fn volume_refusal(path: &Path, size: u64) -> Option<String> {
     }
     let mut info = SHQUERYRBINFO { cbSize: size_of::<SHQUERYRBINFO>() as u32, ..Default::default() };
     if unsafe { SHQueryRecycleBinW(root, &mut info) }.is_err() {
-        return Some("Not deleted: its drive has no Recycle Bin, and this app never deletes permanently.".into());
+        return Some(format!("Not deleted: its drive has no Recycle Bin. {PERMANENT_HINT}"));
     }
     bin_refusal(&bin_settings(root), size)
 }
@@ -253,7 +286,7 @@ fn shell_recycle(path: &Path) -> DeleteOutcome {
 fn outcome(shown: &str, sink: &RecycleSink, performed: WinResult<()>, still_exists: bool) -> DeleteOutcome {
     if sink.refused.get() {
         DeleteOutcome::Refused(format!(
-            "Not deleted: {shown} cannot go to the Recycle Bin (it may be too large for it), and this app never deletes permanently."
+            "Not deleted: {shown} cannot go to the Recycle Bin (it may be too large for it). {PERMANENT_HINT}"
         ))
     } else if sink.destroyed.get() {
         DeleteOutcome::Failed(format!("{shown} was deleted permanently by the shell instead of being recycled."))
@@ -379,6 +412,103 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("does-not-exist.txt");
         assert!(matches!(recycle(&missing, 0), DeleteOutcome::Failed(_)));
+    }
+
+    fn junction(link: &Path, target: &Path) {
+        let status = Command::new("cmd").args(["/C", "mklink", "/J"]).arg(link).arg(target).output().unwrap().status;
+        assert!(status.success(), "mklink /J failed");
+    }
+
+    #[test]
+    fn permanent_delete_removes_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("gone.txt");
+        std::fs::write(&file, b"x").unwrap();
+        assert_eq!(delete_permanently(&file), DeleteOutcome::Deleted);
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn permanent_delete_removes_a_folder_and_its_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("folder with spaces");
+        std::fs::create_dir_all(folder.join("sub")).unwrap();
+        std::fs::write(folder.join("sub").join("inner.txt"), b"x").unwrap();
+        assert_eq!(delete_permanently(&folder), DeleteOutcome::Deleted);
+        assert!(!folder.exists());
+        assert!(dir.path().exists());
+    }
+
+    #[test]
+    fn permanent_delete_removes_read_only_items() {
+        let dir = tempfile::tempdir().unwrap();
+        let read_only = |path: &Path| {
+            let mut perms = std::fs::metadata(path).unwrap().permissions();
+            perms.set_readonly(true);
+            std::fs::set_permissions(path, perms).unwrap();
+        };
+        let file = dir.path().join("read-only.txt");
+        std::fs::write(&file, b"x").unwrap();
+        read_only(&file);
+        let folder = dir.path().join("folder");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("inner.txt"), b"x").unwrap();
+        read_only(&folder.join("inner.txt"));
+
+        assert_eq!(delete_permanently(&file), DeleteOutcome::Deleted);
+        assert_eq!(delete_permanently(&folder), DeleteOutcome::Deleted);
+    }
+
+    #[test]
+    fn permanent_delete_of_a_junction_removes_only_the_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("kept.txt"), b"x").unwrap();
+        let link = dir.path().join("link");
+        junction(&link, &target);
+
+        assert_eq!(delete_permanently(&link), DeleteOutcome::Deleted);
+        assert!(std::fs::symlink_metadata(&link).is_err());
+        assert!(target.join("kept.txt").exists());
+    }
+
+    #[test]
+    fn permanent_delete_of_a_folder_does_not_follow_a_junction_inside() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("kept.txt"), b"x").unwrap();
+        let folder = dir.path().join("folder");
+        std::fs::create_dir(&folder).unwrap();
+        junction(&folder.join("link"), &target);
+
+        assert_eq!(delete_permanently(&folder), DeleteOutcome::Deleted);
+        assert!(!folder.exists());
+        assert!(target.join("kept.txt").exists());
+    }
+
+    #[test]
+    fn permanent_delete_refuses_drive_roots_and_partial_paths() {
+        // A drive letter that does not exist, so nothing could be deleted even if a guard failed.
+        let letter = ('D'..='Z').find(|l| !Path::new(&format!("{l}:\\")).exists()).expect("a free drive letter");
+        for path in [format!(r"{letter}:\"), format!("{letter}:"), format!(r"\\?\{letter}:\"), "dirstat-no-such-item".into()] {
+            let outcome = delete_permanently(Path::new(&path));
+            assert!(matches!(outcome, DeleteOutcome::Refused(_)), "{path}: {outcome:?}");
+        }
+    }
+
+    #[test]
+    fn permanent_delete_of_a_missing_path_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(delete_permanently(&dir.path().join("missing.txt")), DeleteOutcome::Failed(_)));
+    }
+
+    #[test]
+    fn recycle_refusals_point_to_permanent_delete() {
+        let bin = BinSettings { nuke_on_delete: true, ..Default::default() };
+        assert!(bin_refusal(&bin, 1).unwrap().contains("Delete permanently"));
+        assert!(drive_type_refusal(DRIVE_REMOVABLE).unwrap().contains("Delete permanently"));
     }
 
     #[test]

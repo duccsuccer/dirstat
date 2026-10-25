@@ -100,9 +100,10 @@ pub(crate) enum MenuAction {
     Open,
     CopyPath,
     Delete,
+    DeletePermanently,
 }
 
-/// Right-click menu for one item; "Delete to Recycle Bin" is offered only when `deletable`.
+/// Right-click menu for one item; the two deletes are offered only when `deletable`.
 pub(crate) fn item_menu(response: &egui::Response, deletable: bool) -> Option<MenuAction> {
     let mut action = None;
     response.context_menu(|ui| {
@@ -115,11 +116,14 @@ pub(crate) fn item_menu(response: &egui::Response, deletable: bool) -> Option<Me
         if deletable && ui.button("Delete to Recycle Bin").clicked() {
             action = Some(MenuAction::Delete);
         }
+        if deletable && ui.button("Delete permanently…").clicked() {
+            action = Some(MenuAction::DeletePermanently);
+        }
     });
     action
 }
 
-/// Runs a context-menu choice; delete only opens the confirmation dialog. Open and copy failures go to `error`.
+/// Runs a context-menu choice; a delete only opens its confirmation dialog. Open and copy failures go to `error`.
 pub(crate) fn apply_menu_action(state: &mut AppState, id: NodeId, action: MenuAction) {
     let Some(tree) = &state.tree else { return };
     let path = tree.path(id);
@@ -127,7 +131,11 @@ pub(crate) fn apply_menu_action(state: &mut AppState, id: NodeId, action: MenuAc
         MenuAction::Open => actions::open_in_explorer(Path::new(&actions::shell_path(path.clone()))).map_err(|e| e.to_string()),
         MenuAction::CopyPath => actions::copy_path(&actions::shell_path(path.clone())),
         MenuAction::Delete => {
-            state.pending_delete = Some(id);
+            (state.pending_delete, state.pending_permanent) = (Some(id), None);
+            Ok(())
+        }
+        MenuAction::DeletePermanently => {
+            (state.pending_delete, state.pending_permanent) = (None, Some(id));
             Ok(())
         }
     };

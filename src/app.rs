@@ -25,6 +25,8 @@ pub struct AppState {
     pub scroll_to_selected: bool,
     /// Item whose delete confirmation dialog is open.
     pub pending_delete: Option<NodeId>,
+    /// Item whose permanent-delete confirmation dialog is open.
+    pub pending_permanent: Option<NodeId>,
     /// Why the last delete did not happen; shown in a dialog until dismissed.
     pub delete_notice: Option<String>,
 }
@@ -52,6 +54,7 @@ impl AppState {
             treemap_cache: None,
             scroll_to_selected: false,
             pending_delete: None,
+            pending_permanent: None,
             delete_notice: None,
         }
     }
@@ -83,6 +86,12 @@ impl AppState {
         self.delete_selected_with(confirmed, actions::recycle);
     }
 
+    /// Deletes the selected item for good, without the Recycle Bin, once the user has confirmed. Never the scan root.
+    pub fn delete_selected_permanently(&mut self, confirmed: bool) {
+        self.delete_selected_with(confirmed, |path, _| actions::delete_permanently(path));
+    }
+
+    /// Runs `recycle` (or a permanent delete) on the confirmed selection and updates the tree when it is gone.
     pub(crate) fn delete_selected_with(&mut self, confirmed: bool, recycle: impl FnOnce(&Path, u64) -> DeleteOutcome) {
         let (Some(tree), Some(id)) = (self.tree.as_mut(), self.selected) else { return };
         // A detached node's path would be relative (just its name), so it must never reach `recycle`.
@@ -93,7 +102,7 @@ impl AppState {
         let node = &tree.nodes[id.0 as usize];
         let size = node.logical.max(node.size);
         match recycle(Path::new(&tree.path(id)), size) {
-            DeleteOutcome::Recycled => {
+            DeleteOutcome::Recycled | DeleteOutcome::Deleted => {
                 self.selected = tree.nodes[id.0 as usize].parent;
                 tree.remove(id);
                 self.delete_notice = None;
@@ -124,6 +133,7 @@ impl AppState {
                     self.selected = None;
                     // Ids from the old tree may name a different item in the new one.
                     self.pending_delete = None;
+                    self.pending_permanent = None;
                     self.treemap_cache = None;
                     self.tree = Some(tree);
                     self.mode = Some(mode);
@@ -166,7 +176,8 @@ impl eframe::App for AppState {
     }
 }
 
-/// The delete confirmation for `pending_delete`, then the notice explaining a refused or failed delete.
+/// The delete confirmations for `pending_delete` and `pending_permanent`, then the notice explaining a refused or
+/// failed delete.
 fn delete_dialogs(ctx: &egui::Context, state: &mut AppState) {
     if let (Some(id), Some(tree)) = (state.pending_delete, &state.tree) {
         let text = format!("Move {} ({}) to the Recycle Bin?", tree.path(id), ui_tree::format_size(tree.nodes[id.0 as usize].size));
@@ -187,6 +198,37 @@ fn delete_dialogs(ctx: &egui::Context, state: &mut AppState) {
             if delete {
                 state.selected = Some(id);
                 state.delete_selected(true);
+            }
+        }
+    }
+    if let (Some(id), Some(tree)) = (state.pending_permanent, &state.tree) {
+        let text = format!(
+            "Permanently delete {} ({})?\n\nIt will not go to the Recycle Bin. This cannot be undone.",
+            tree.path(id),
+            ui_tree::format_size(tree.nodes[id.0 as usize].size)
+        );
+        let mut choice = None;
+        dialog("Delete permanently").show(ctx, |ui| {
+            ui.label(text);
+            ui.horizontal(|ui| {
+                let cancel = ui.button("Cancel");
+                // Enter or Space acts on the focused button, so focus starts on Cancel.
+                if ui.memory(|m| m.focused().is_none()) {
+                    cancel.request_focus();
+                }
+                if cancel.clicked() {
+                    choice = Some(false);
+                }
+                if ui.button("Delete permanently").clicked() {
+                    choice = Some(true);
+                }
+            });
+        });
+        if let Some(delete) = choice {
+            state.pending_permanent = None;
+            if delete {
+                state.selected = Some(id);
+                state.delete_selected_permanently(true);
             }
         }
     }
@@ -407,6 +449,27 @@ mod tests {
         state.selected = Some(f);
         state.delete_selected_with(true, |_, _| panic!("recycle must not be called"));
         assert_eq!(root_size(&state), 7);
+    }
+
+    #[test]
+    fn permanent_delete_updates_tree_in_place() {
+        let (mut state, a, _) = state_with_file();
+        state.delete_selected_with(true, |path, _| {
+            assert_eq!(path, Path::new(r"C:\a\f.bin"));
+            DeleteOutcome::Deleted
+        });
+        assert_eq!(root_size(&state), 7);
+        assert_eq!(state.selected, Some(a));
+    }
+
+    #[test]
+    fn rescan_clears_pending_permanent_delete() {
+        let (mut state, _, f) = state_with_file();
+        state.pending_permanent = Some(f);
+        let tx = state.install_channel();
+        tx.send(ScanEvent::Done { tree: tree(), mode: ScanMode::Walk, skipped: 0 }).unwrap();
+        state.pump();
+        assert!(state.pending_permanent.is_none());
     }
 
     #[test]

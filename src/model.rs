@@ -36,10 +36,13 @@ pub struct Tree {
 pub struct TreeBuilder {
     nodes: Vec<Node>,
     ext_ids: HashMap<String, u16>,
+    other_id: Option<u16>,
     exts: Vec<ExtStat>,
 }
 
 const NO_EXT: u16 = u16::MAX;
+/// Last usable extension id; ids below it are individual extensions, this one is the "(other)" bucket.
+const OTHER_EXT_ID: u16 = u16::MAX - 1;
 
 impl TreeBuilder {
     pub fn new(root_name: &str) -> Self {
@@ -52,7 +55,7 @@ impl TreeBuilder {
             ext: NO_EXT,
             children: Vec::new(),
         };
-        TreeBuilder { nodes: vec![root], ext_ids: HashMap::new(), exts: Vec::new() }
+        TreeBuilder { nodes: vec![root], ext_ids: HashMap::new(), other_id: None, exts: Vec::new() }
     }
 
     pub fn add(&mut self, parent: NodeId, name: &str, is_dir: bool, size: u64, logical: u64) -> NodeId {
@@ -84,10 +87,22 @@ impl TreeBuilder {
         if let Some(&id) = self.ext_ids.get(&ext) {
             return id;
         }
-        let id = u16::try_from(self.exts.len()).expect("more than 65534 distinct extensions");
-        self.exts.push(ExtStat { ext: ext.clone(), size: 0, count: 0 });
-        self.ext_ids.insert(ext, id);
-        id
+        if self.exts.len() < OTHER_EXT_ID as usize {
+            let id = self.exts.len() as u16;
+            self.exts.push(ExtStat { ext: ext.clone(), size: 0, count: 0 });
+            self.ext_ids.insert(ext, id);
+            return id;
+        }
+        // Table full: every further new extension shares one "(other)" bucket.
+        match self.other_id {
+            Some(id) => id,
+            None => {
+                let id = self.exts.len() as u16;
+                self.exts.push(ExtStat { ext: "(other)".to_string(), size: 0, count: 0 });
+                self.other_id = Some(id);
+                id
+            }
+        }
     }
 
     pub fn finish(mut self) -> Tree {
@@ -266,5 +281,24 @@ mod tests {
 
         assert_eq!(t.path(f), "C:\\a\\b.txt");
         assert_eq!(t.path(t.root), "C:");
+    }
+
+    #[test]
+    fn ext_table_overflow_maps_to_shared_other_bucket() {
+        let mut b = TreeBuilder::new("root");
+        let root = NodeId(0);
+        // Real extensions fill ids 0..=65533; the next new one opens the "(other)" bucket.
+        let total = 70_000u64;
+        for i in 0..total {
+            b.add(root, &format!("f.e{i}"), false, 1, 1);
+        }
+        let t = b.finish();
+
+        let other = t.exts.iter().find(|e| e.ext == "(other)").unwrap();
+        assert_eq!((other.size, other.count), (total - 65_534, total - 65_534));
+        assert_eq!(t.exts.len(), 65_535);
+        assert_eq!(t.exts.iter().map(|e| e.count).sum::<u64>(), total);
+        // Largest bucket sorts first.
+        assert_eq!(t.exts[0].ext, "(other)");
     }
 }

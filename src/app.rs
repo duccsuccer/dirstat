@@ -106,7 +106,7 @@ impl AppState {
             return;
         }
         let path = actions::shell_path(tree.path(id));
-        let items = [(AppItem::Explore, true), (AppItem::CommandPrompt, true), (AppItem::CopyPath, true)];
+        let items = [(AppItem::Explore, true), (AppItem::CommandPrompt, true), (AppItem::CopyPath, true), (AppItem::CopyInfo, true)];
         match actions::show_context_menu(HWND(self.hwnd as *mut _), Path::new(&path), extended, &items, has_shell_menu(tree, id)) {
             Ok(Chosen::Shell) => self.forget_if_gone(id, exists),
             Ok(Chosen::App(item)) => self.app_item(id, item),
@@ -123,7 +123,8 @@ impl AppState {
         let result = match item {
             AppItem::Explore => actions::explore(Path::new(&path), !tree.nodes[id.0 as usize].is_dir).map_err(|e| format!("{path}: {e}")),
             AppItem::CommandPrompt => actions::command_prompt(Path::new(&dir)).map_err(|e| format!("{dir}: {e}")),
-            AppItem::CopyPath => actions::copy_path(&path).map_err(|e| format!("{path}: {e}")),
+            AppItem::CopyPath => actions::copy_text(&path).map_err(|e| format!("{path}: {e}")),
+            AppItem::CopyInfo => actions::copy_text(&info_line(tree, id)).map_err(|e| format!("{path}: {e}")),
         };
         if let Err(e) = result {
             self.error = Some(e);
@@ -150,7 +151,7 @@ impl AppState {
             return;
         }
         let path = actions::shell_path(tree.path(id));
-        if let Err(e) = actions::copy_path(&path) {
+        if let Err(e) = actions::copy_text(&path) {
             self.error = Some(format!("{path}: {e}"));
         }
     }
@@ -375,6 +376,33 @@ fn disk_lines(disk: Option<(u64, u64)>) -> [(&'static str, String); 3] {
     [("Total space:", ui_tree::format_size(total)), ("Space used:", with_share(used)), ("Space free:", with_share(free))]
 }
 
+/// Item `id`'s items, files and folders as the tree counts them (a file is one item and one file).
+fn counts(tree: &Tree, id: NodeId) -> (u64, u64, u64) {
+    let node = &tree.nodes[id.0 as usize];
+    if node.is_dir {
+        let (files, folders) = (u64::from(node.files), u64::from(node.folders));
+        (files + folders, files, folders)
+    } else {
+        (1, 1, 0)
+    }
+}
+
+/// The line Copy file and size info puts on the clipboard for item `id`: tab-separated path, logical size, size on
+/// disk, items, files and folders.
+pub fn info_line(tree: &Tree, id: NodeId) -> String {
+    let node = &tree.nodes[id.0 as usize];
+    let (items, files, folders) = counts(tree, id);
+    [
+        actions::shell_path(tree.path(id)),
+        node.logical.to_string(),
+        node.size.to_string(),
+        items.to_string(),
+        files.to_string(),
+        folders.to_string(),
+    ]
+    .join("\t")
+}
+
 /// The status line under the treemap for item `id`: how many files it holds (1 for a file), its logical size and
 /// its size on disk.
 pub fn selection_status(tree: &Tree, id: NodeId) -> String {
@@ -551,6 +579,15 @@ mod tests {
         tx.send(ScanEvent::Done { tree: tree(), mode: ScanMode::Walk, skipped: 0 }).unwrap();
         state.pump();
         assert!(state.pending_menu.is_none());
+    }
+
+    #[test]
+    fn info_line_is_tab_separated_for_files_and_folders() {
+        let (state, a, f) = state_with_file();
+        let tree = state.tree.as_ref().unwrap();
+        assert_eq!(info_line(tree, f), "C:\\a\\f.bin\t10\t10\t1\t1\t0");
+        assert_eq!(info_line(tree, a), "C:\\a\t10\t10\t1\t1\t0");
+        assert_eq!(info_line(tree, tree.root), "C:\\\t17\t17\t3\t2\t1");
     }
 
     #[test]

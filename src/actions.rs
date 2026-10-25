@@ -32,9 +32,9 @@ pub fn shell_path(mut path: String) -> String {
     path
 }
 
-pub fn copy_path(path: &str) -> Result<(), String> {
+pub fn copy_text(text: &str) -> Result<(), String> {
     arboard::Clipboard::new()
-        .and_then(|mut clipboard| clipboard.set_text(path))
+        .and_then(|mut clipboard| clipboard.set_text(text))
         .map_err(|e| e.to_string())
 }
 
@@ -54,16 +54,18 @@ pub enum AppItem {
     Explore,
     CommandPrompt,
     CopyPath,
+    CopyInfo,
 }
 
 impl AppItem {
-    const ALL: [AppItem; 3] = [AppItem::Explore, AppItem::CommandPrompt, AppItem::CopyPath];
+    const ALL: [AppItem; 4] = [AppItem::Explore, AppItem::CommandPrompt, AppItem::CopyPath, AppItem::CopyInfo];
 
     fn label(self) -> &'static str {
         match self {
             AppItem::Explore => "Explore Folder",
             AppItem::CommandPrompt => "Command Prompt Here",
             AppItem::CopyPath => "Copy Path",
+            AppItem::CopyInfo => "Copy file and size info to clipboard",
         }
     }
 

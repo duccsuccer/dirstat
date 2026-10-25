@@ -77,13 +77,16 @@ impl AppState {
         self.delete_selected_with(confirmed, actions::recycle);
     }
 
-    pub(crate) fn delete_selected_with(&mut self, confirmed: bool, recycle: impl FnOnce(&Path) -> DeleteOutcome) {
+    pub(crate) fn delete_selected_with(&mut self, confirmed: bool, recycle: impl FnOnce(&Path, u64) -> DeleteOutcome) {
         let (Some(tree), Some(id)) = (self.tree.as_mut(), self.selected) else { return };
         // A detached node's path would be relative (just its name), so it must never reach `recycle`.
         if !confirmed || id == tree.root || !tree.is_attached(id) {
             return;
         }
-        match recycle(Path::new(&tree.path(id))) {
+        // The larger of the two sizes, so the bin-limit check can only err towards refusing.
+        let node = &tree.nodes[id.0 as usize];
+        let size = node.logical.max(node.size);
+        match recycle(Path::new(&tree.path(id)), size) {
             DeleteOutcome::Recycled => {
                 self.selected = tree.nodes[id.0 as usize].parent;
                 tree.remove(id);
@@ -305,7 +308,7 @@ mod tests {
     #[test]
     fn delete_selected_requires_confirmation() {
         let (mut state, _, f) = state_with_file();
-        state.delete_selected_with(false, |_| panic!("recycle must not be called"));
+        state.delete_selected_with(false, |_, _| panic!("recycle must not be called"));
         assert_eq!(root_size(&state), 17);
         assert_eq!(state.selected, Some(f));
     }
@@ -314,7 +317,7 @@ mod tests {
     fn delete_root_is_never_performed() {
         let (mut state, _, _) = state_with_file();
         state.selected = state.tree.as_ref().map(|t| t.root);
-        state.delete_selected_with(true, |_| panic!("recycle must not be called"));
+        state.delete_selected_with(true, |_, _| panic!("recycle must not be called"));
         assert_eq!(root_size(&state), 17);
     }
 
@@ -322,15 +325,16 @@ mod tests {
     fn delete_without_selection_does_nothing() {
         let (mut state, _, _) = state_with_file();
         state.selected = None;
-        state.delete_selected_with(true, |_| panic!("recycle must not be called"));
+        state.delete_selected_with(true, |_, _| panic!("recycle must not be called"));
         assert_eq!(root_size(&state), 17);
     }
 
     #[test]
     fn refused_delete_leaves_tree_unchanged() {
         let (mut state, _, f) = state_with_file();
-        state.delete_selected_with(true, |path| {
+        state.delete_selected_with(true, |path, size| {
             assert_eq!(path, Path::new(r"C:\a\f.bin"));
+            assert_eq!(size, 10);
             DeleteOutcome::Refused("no bin".into())
         });
         assert_eq!(root_size(&state), 17);
@@ -341,7 +345,7 @@ mod tests {
     #[test]
     fn failed_delete_sets_notice() {
         let (mut state, _, _) = state_with_file();
-        state.delete_selected_with(true, |_| DeleteOutcome::Failed("locked".into()));
+        state.delete_selected_with(true, |_, _| DeleteOutcome::Failed("locked".into()));
         assert_eq!(root_size(&state), 17);
         assert_eq!(state.delete_notice.as_deref(), Some("locked"));
     }
@@ -358,7 +362,7 @@ mod tests {
             highlight_for: None,
             highlight: Default::default(),
         });
-        state.delete_selected_with(true, |_| DeleteOutcome::Recycled);
+        state.delete_selected_with(true, |_, _| DeleteOutcome::Recycled);
         let tree = state.tree.as_ref().unwrap();
         assert_eq!(tree.nodes[a.0 as usize].size, 0);
         assert_eq!(root_size(&state), 7);
@@ -373,7 +377,7 @@ mod tests {
         let (mut state, a, f) = state_with_file();
         state.tree.as_mut().unwrap().remove(a);
         state.selected = Some(f);
-        state.delete_selected_with(true, |_| panic!("recycle must not be called"));
+        state.delete_selected_with(true, |_, _| panic!("recycle must not be called"));
         assert_eq!(root_size(&state), 7);
     }
 

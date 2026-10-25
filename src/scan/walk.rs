@@ -4,7 +4,7 @@ use crate::model::{NodeId, Tree, TreeBuilder};
 use rayon::prelude::*;
 use std::collections::HashSet;
 use std::ffi::OsString;
-use std::fs::{self, DirEntry, OpenOptions};
+use std::fs::{self, DirEntry, File, OpenOptions};
 use std::mem::size_of;
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::os::windows::io::AsRawHandle;
@@ -14,10 +14,14 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::Mutex;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::{
-    FileStandardInfo, GetFileInformationByHandle, GetFileInformationByHandleEx, BY_HANDLE_FILE_INFORMATION,
-    FILE_ATTRIBUTE_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FileAttributeTagInfo, FileStandardInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
+    BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     FILE_STANDARD_INFO,
 };
+
+const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
+const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
 
 /// Scans `root` with a parallel directory walk. Calls `on_progress` with running file and allocated-byte totals.
 /// Returns the tree and the number of entries that could not be read.
@@ -101,16 +105,22 @@ fn scan_dir(dir: &Path, ctx: &Ctx) -> (Vec<Entry>, u64) {
 
 fn scan_entry(entry: &DirEntry, ctx: &Ctx) -> (Option<Entry>, u64) {
     let Ok(meta) = entry.metadata() else { return (None, 1) };
-    // Junctions and symlinks are skipped, so each target is counted only where it really lives.
+    let path = entry.path();
+    // Only links are skipped, so each target is counted where it really lives. Other reparse tags
+    // (cloud placeholders, WOF, dedup) are ordinary content that Windows counts.
     if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
-        return (None, 0);
+        match reparse_tag(&path) {
+            Some(tag) if is_name_surrogate(tag) => return (None, 0),
+            Some(_) => {}
+            None => return (None, 1),
+        }
     }
     let name = entry.file_name().to_string_lossy().into_owned();
     if meta.is_dir() {
-        let (children, skipped) = scan_dir(&entry.path(), ctx);
+        let (children, skipped) = scan_dir(&path, ctx);
         return (Some(Entry::Dir { name, children }), skipped);
     }
-    let Some(info) = file_info(&entry.path()) else { return (None, 1) };
+    let Some(info) = file_info(&path) else { return (None, 1) };
     if info.links > 1 && !ctx.seen.lock().unwrap().insert((info.volume, info.index)) {
         return (None, 0);
     }
@@ -125,12 +135,39 @@ struct FileInfo {
     index: u64,
 }
 
-fn file_info(path: &Path) -> Option<FileInfo> {
-    let file = OpenOptions::new()
+/// Opens `path` for attribute reads only. `flags` are extra `FILE_FLAG_*` values.
+fn open_attributes(path: &Path, flags: u32) -> Option<File> {
+    OpenOptions::new()
         .access_mode(FILE_READ_ATTRIBUTES.0)
         .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0 | FILE_SHARE_DELETE.0)
+        .custom_flags(flags)
         .open(path)
+        .ok()
+}
+
+/// Reparse tag of a reparse point, read without following it.
+fn reparse_tag(path: &Path) -> Option<u32> {
+    let file = open_attributes(path, FILE_FLAG_OPEN_REPARSE_POINT.0 | FILE_FLAG_BACKUP_SEMANTICS.0)?;
+    let mut info = FILE_ATTRIBUTE_TAG_INFO::default();
+    unsafe {
+        GetFileInformationByHandleEx(
+            HANDLE(file.as_raw_handle()),
+            FileAttributeTagInfo,
+            (&mut info as *mut FILE_ATTRIBUTE_TAG_INFO).cast(),
+            size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+        )
         .ok()?;
+    }
+    Some(info.ReparseTag)
+}
+
+/// Symlinks and junctions name another location; the walk must not follow them.
+fn is_name_surrogate(tag: u32) -> bool {
+    tag == IO_REPARSE_TAG_SYMLINK || tag == IO_REPARSE_TAG_MOUNT_POINT
+}
+
+fn file_info(path: &Path) -> Option<FileInfo> {
+    let file = open_attributes(path, 0)?;
     let handle = HANDLE(file.as_raw_handle());
     let mut std_info = FILE_STANDARD_INFO::default();
     let mut by_handle = BY_HANDLE_FILE_INFORMATION::default();
@@ -266,25 +303,53 @@ mod tests {
         assert!(find(&tree, "locked\\hidden.bin").is_none());
     }
 
+    fn junction(link: &Path, target: &Path) {
+        let status = Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .unwrap()
+            .status;
+        assert!(status.success(), "mklink /J failed");
+    }
+
     #[test]
     fn junction_is_not_followed() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("target");
         fs::create_dir(&target).unwrap();
         fs::write(target.join("f.bin"), b"data").unwrap();
-        let status = Command::new("cmd")
-            .args(["/C", "mklink", "/J"])
-            .arg(dir.path().join("link"))
-            .arg(&target)
-            .output()
-            .unwrap()
-            .status;
-        assert!(status.success(), "mklink /J failed");
+        junction(&dir.path().join("link"), &target);
 
         let (tree, _) = scan(dir.path());
 
         assert_eq!(count_named(&tree, "f.bin"), 1);
         assert!(find(&tree, "link").is_none());
+    }
+
+    #[test]
+    fn junction_to_parent_terminates_and_counts_once() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("top.bin"), b"t").unwrap();
+        let inner = dir.path().join("inner");
+        fs::create_dir(&inner).unwrap();
+        fs::write(inner.join("deep.bin"), b"d").unwrap();
+        junction(&inner.join("up"), dir.path());
+
+        let (tree, _) = scan(dir.path());
+
+        assert_eq!(count_named(&tree, "top.bin"), 1);
+        assert_eq!(count_named(&tree, "deep.bin"), 1);
+        assert!(find(&tree, "inner\\up").is_none());
+    }
+
+    #[test]
+    fn only_symlink_and_mount_point_tags_are_skipped() {
+        assert!(is_name_surrogate(0xA000_000C)); // symlink
+        assert!(is_name_surrogate(0xA000_0003)); // mount point (junction)
+        assert!(!is_name_surrogate(0x9000_001A)); // cloud placeholder
+        assert!(!is_name_surrogate(0x8000_0017)); // WOF compressed file
     }
 
     #[test]

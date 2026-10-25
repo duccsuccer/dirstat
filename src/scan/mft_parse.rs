@@ -146,8 +146,10 @@ fn parse_file_name(value: &[u8]) -> Option<FileName> {
     let namespace = *value.get(0x41)?;
     let units: Vec<u16> = value
         .get(0x42..0x42 + 2 * chars)?
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
         .collect();
     Some(FileName {
         parent,

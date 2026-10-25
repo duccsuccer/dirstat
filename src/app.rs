@@ -29,6 +29,12 @@ pub struct AppState {
     pub delete_notice: Option<String>,
 }
 
+impl Default for AppState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AppState {
     pub fn new() -> Self {
         let (_, rx) = channel();

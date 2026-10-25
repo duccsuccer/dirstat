@@ -78,6 +78,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
             }
         });
 
+    #[allow(clippy::collapsible_match)] // the toggle's `if` cannot become a guard without losing exhaustiveness
     match click {
         Some(Click::Select(id)) => state.selected = Some(id),
         Some(Click::Toggle(id)) => {

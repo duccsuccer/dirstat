@@ -168,7 +168,7 @@ mod tests {
     #[test]
     fn subpixel_blocks_are_dropped() {
         let mut sizes = vec![1_000_000u64];
-        sizes.extend(std::iter::repeat(1).take(1000));
+        sizes.extend(std::iter::repeat_n(1, 1000));
         let tree = file_tree(&sizes);
         let blocks = layout(&tree, tree.root, BOUNDS);
         assert!(blocks.len() < 1001);

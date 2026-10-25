@@ -105,7 +105,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
 
 /// True when the pane must be laid out again. Sizes equal after rounding to whole pixels count as unchanged.
 pub fn needs_relayout(old: Option<(f32, f32)>, new: (f32, f32)) -> bool {
-    old.map_or(true, |o| o.0.round() != new.0.round() || o.1.round() != new.1.round())
+    old.is_none_or(|o| o.0.round() != new.0.round() || o.1.round() != new.1.round())
 }
 
 /// The outline rects to draw: the rects themselves up to `HIGHLIGHT_LIMIT`, past it one box around all of them.

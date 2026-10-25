@@ -75,6 +75,7 @@ fn drive_letter(target: &ScanTarget) -> Option<char> {
 }
 
 /// The scanner backends, as values so tests can inject them.
+#[allow(clippy::type_complexity)]
 struct Scanners {
     mft: Box<dyn Fn(char, Option<&Path>, &AtomicBool, &mut dyn FnMut(u64, u64)) -> Result<Tree, String> + Send>,
     walk: Box<dyn Fn(&Path, &AtomicBool, &mut dyn FnMut(u64, u64)) -> (Tree, u64) + Send>,

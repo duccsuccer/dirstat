@@ -191,11 +191,12 @@ pub(crate) fn header(ui: &mut egui::Ui, row_h: f32, columns: &[(&str, f32)], fle
     let widths: Vec<f32> = columns.iter().map(|&(_, w)| w).collect();
     let pal = palette(ui.visuals().dark_mode);
     let painter = ui.painter();
+    painter.rect_filled(rect, 0.0, pal.header_bg);
     for (i, (cell, (title, _))) in cells(rect, &widths, flex).iter().zip(columns).enumerate() {
         let (x, align) = if i > flex { (cell.right() - CELL_PAD, Align2::RIGHT_CENTER) } else { (cell.left() + CELL_PAD, Align2::LEFT_CENTER) };
         painter.with_clip_rect(*cell).text(Pos2::new(x, cell.center().y), align, title, FontId::proportional(11.0), pal.header);
     }
-    painter.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, pal.rule));
+    painter.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, pal.separator));
 }
 
 /// The selected row's fill, then the hairline under every row.

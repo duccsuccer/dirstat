@@ -9,6 +9,10 @@ pub struct Palette {
     pub muted: Color32,
     pub header: Color32,
     pub rule: Color32,
+    /// Borders between panes, and under table headers.
+    pub separator: Color32,
+    /// Table header rows, a shade off the pane background.
+    pub header_bg: Color32,
     pub accent: Color32,
     pub accent_hover: Color32,
     pub on_accent: Color32,
@@ -29,6 +33,8 @@ const LIGHT: Palette = Palette {
     muted: hex(0xa8929a),
     header: hex(0xb9a3a8),
     rule: hex(0xf4e7e2),
+    separator: hex(0xe3cfc8),
+    header_bg: hex(0xf9f0eb),
     accent: hex(0xff8fa6),
     accent_hover: hex(0xff7692),
     on_accent: hex(0xffffff),
@@ -44,6 +50,8 @@ const DARK: Palette = Palette {
     muted: hex(0x9d868f),
     header: hex(0x8f7882),
     rule: hex(0x2c2226),
+    separator: hex(0x3a2c33),
+    header_bg: hex(0x251c21),
     accent: hex(0xff8fa6),
     accent_hover: hex(0xffa6b8),
     on_accent: hex(0x3f1220),

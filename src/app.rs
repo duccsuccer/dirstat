@@ -244,24 +244,38 @@ impl eframe::App for AppState {
         if ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy))) {
             self.copy_selected_path();
         }
-        egui::Panel::top("top_bar").frame(panel_frame(ui)).show(ui, |ui| top_bar(ui, self));
-        egui::Panel::bottom("status").frame(panel_frame(ui)).show(ui, |ui| {
-            if let Some(tree) = &self.tree {
-                let text = selection_status(tree, status_node(tree, self.selected, self.treemap_root));
-                ui.colored_label(palette(ui.visuals().dark_mode).muted, text);
-            }
-        });
+        // 1px lines between the panes, drawn on the edges where two panes meet.
+        let line = egui::Stroke::new(1.0, palette(ui.visuals().dark_mode).separator);
+        let top = egui::Panel::top("top_bar").frame(panel_frame(ui)).show(ui, |ui| top_bar(ui, self)).response.rect;
+        ui.painter().hline(top.x_range(), top.bottom() - 0.5, line);
+        let status = egui::Panel::bottom("status")
+            .frame(panel_frame(ui))
+            .show(ui, |ui| {
+                if let Some(tree) = &self.tree {
+                    let text = selection_status(tree, status_node(tree, self.selected, self.treemap_root));
+                    ui.colored_label(palette(ui.visuals().dark_mode).muted, text);
+                }
+            })
+            .response
+            .rect;
+        ui.painter().hline(status.x_range(), status.top() + 0.5, line);
         let treemap_height = ui.ctx().content_rect().height() * 0.4;
-        egui::Panel::bottom("treemap")
+        let treemap = egui::Panel::bottom("treemap")
             .frame(panel_frame(ui))
             .resizable(true)
             .default_size(treemap_height)
-            .show(ui, |ui| ui_treemap::show(ui, self));
-        egui::Panel::right("legend")
+            .show(ui, |ui| ui_treemap::show(ui, self))
+            .response
+            .rect;
+        ui.painter().hline(treemap.x_range(), treemap.top() + 0.5, line);
+        let legend = egui::Panel::right("legend")
             .frame(panel_frame(ui))
             .resizable(true)
             .default_size(500.0)
-            .show(ui, |ui| ui_legend::show(ui, self));
+            .show(ui, |ui| ui_legend::show(ui, self))
+            .response
+            .rect;
+        ui.painter().vline(legend.left() + 0.5, legend.y_range(), line);
         egui::CentralPanel::default().frame(panel_frame(ui)).show(ui, |ui| {
             if self.target.is_none() {
                 ui.centered_and_justified(|ui| ui.heading("Choose a drive or folder to scan"));

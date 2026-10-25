@@ -1,0 +1,14 @@
+[package]
+name = "dirstat"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+[build-dependencies]
+embed-resource = "3.0.12"
+
+[[bin]]
+name = "dirstat"
+path = "src/main.rs"
+test = false

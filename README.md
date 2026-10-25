@@ -50,5 +50,5 @@ Walk rows were measured unelevated on one machine, with the file-cache state not
 - Stage 1 only: scan, tree and treemap views, open, copy path, and delete to the Recycle Bin. Permanent delete and other stage 2 features are not built.
 - Windows and NTFS only for the fast path. Other filesystems (FAT32, exFAT, network shares) use the slower walk.
 - The MFT scan and the delete-refusal cases have **not yet been verified on a real volume**.
-- Files whose data lives only in `$ATTRIBUTE_LIST` extension records are reported with 0 bytes. This affects large, heavily fragmented files.
+- Large, heavily fragmented files whose data lives in `$ATTRIBUTE_LIST` extension records: the MFT scan takes their sizes from the `$DATA` extent that starts at VCN 0 (the only one that records the stream sizes), wherever it lives, and takes a missing `$FILE_NAME` from an extension record. Only the first name found in extension records is used (further hard links held there are ignored), and a `$REPARSE_POINT` held only in an extension record is not seen.
 - There is no scan-time tree preview: the tree and treemap appear when the scan ends.

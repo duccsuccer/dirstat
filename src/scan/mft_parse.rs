@@ -34,9 +34,36 @@ struct FileName {
     name: String,
 }
 
+/// What an extension record (one listed in its base record's `$ATTRIBUTE_LIST`) adds to its base record.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Extension {
+    /// 48-bit record number of the base record.
+    pub base: u64,
+    /// (allocated, logical) from the unnamed `$DATA` extent starting at VCN 0, when this record holds it.
+    pub data: Option<(u64, u64)>,
+    /// (parent, name) from a `$FILE_NAME` held here, non-DOS preferred.
+    pub name: Option<(u64, String)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Parsed {
+    /// A base record. Its `name` is empty when its `$FILE_NAME` lives only in an extension record.
+    Base(MftRecord),
+    Extension(Extension),
+}
+
 /// Parses one raw file record. `index` is the caller's record number.
 /// Returns `None` for unused, extension (non-base), corrupt or nameless records.
 pub fn parse_record(buf: &mut [u8], index: u64) -> Option<MftRecord> {
+    match parse_any(buf, index)? {
+        Parsed::Base(r) if !r.name.is_empty() => Some(r),
+        _ => None,
+    }
+}
+
+/// Parses one raw file record, base or extension. Returns `None` for unused or corrupt records and for
+/// extension records that hold neither a first `$DATA` extent nor a `$FILE_NAME`.
+pub fn parse_any(buf: &mut [u8], index: u64) -> Option<Parsed> {
     if buf.get(0..4)? != b"FILE" {
         return None;
     }
@@ -44,9 +71,10 @@ pub fn parse_record(buf: &mut [u8], index: u64) -> Option<MftRecord> {
     let buf: &[u8] = buf;
 
     let flags = u16_at(buf, 0x16)?;
-    if flags & FLAG_IN_USE == 0 || u64_at(buf, 0x20)? != 0 {
+    if flags & FLAG_IN_USE == 0 {
         return None;
     }
+    let base = u64_at(buf, 0x20)? & PARENT_REF_MASK;
 
     let mut names = Vec::new();
     let mut data = None;
@@ -65,7 +93,8 @@ pub fn parse_record(buf: &mut [u8], index: u64) -> Option<MftRecord> {
         let non_resident = attr[8] != 0;
         if ty == ATTR_FILE_NAME && !non_resident {
             names.push(parse_file_name(resident_value(attr)?)?);
-        } else if ty == ATTR_DATA && attr[9] == 0 && data.is_none() {
+        } else if ty == ATTR_DATA && attr[9] == 0 && data.is_none() && (!non_resident || u64_at(attr, 0x10)? == 0) {
+            // Only the extent starting at VCN 0 carries the stream sizes; later extents report 0.
             data = Some(data_sizes(attr, non_resident)?);
         } else if ty == ATTR_REPARSE_POINT && !non_resident {
             let tag = u32_at(resident_value(attr)?, 0)?;
@@ -74,26 +103,27 @@ pub fn parse_record(buf: &mut [u8], index: u64) -> Option<MftRecord> {
         off += len;
     }
 
-    let chosen = names
-        .iter()
-        .find(|n| n.namespace != NS_DOS)
-        .or(names.first())?;
+    let chosen = names.iter().find(|n| n.namespace != NS_DOS).or(names.first());
+    if base != 0 {
+        let name = chosen.map(|n| (n.parent, n.name.clone()));
+        return (data.is_some() || name.is_some()).then_some(Parsed::Extension(Extension { base, data, name }));
+    }
     let is_dir = flags & FLAG_DIRECTORY != 0;
-    // shortcut: $DATA living only in an $ATTRIBUTE_LIST extension record is not followed, so such files report 0 size, upgrade by following attribute-list extension records
+    // $DATA living only in an extension record is filled in from that record by the caller (`Extension`).
     let (allocated, logical) = match (is_dir, data) {
         (false, Some(sizes)) => sizes,
         _ => (0, 0),
     };
 
-    Some(MftRecord {
+    Some(Parsed::Base(MftRecord {
         index,
-        parent: chosen.parent,
-        name: chosen.name.clone(),
+        parent: chosen.map_or(0, |n| n.parent),
+        name: chosen.map_or_else(String::new, |n| n.name.clone()),
         is_dir,
         allocated,
         logical,
         is_reparse,
-    })
+    }))
 }
 
 /// Undoes the update-sequence protection: checks each sector's last two bytes against the
@@ -370,6 +400,60 @@ mod tests {
         let mut rec = make_record(FLAG_IN_USE, &[(5, NS_WIN32, "ext.txt")], &[]);
         rec[0x20] = 5; // base file reference is non-zero
         assert!(parse_record(&mut rec, 1).is_none());
+    }
+
+    const BASE_REF: u64 = (7 << 48) | 40;
+
+    fn extent_at(vcn: u64, allocated: u64, real: u64) -> Vec<u8> {
+        let mut a = nonresident_attr(TYPE_DATA, 0, allocated, real);
+        put(&mut a, 0x10, &vcn.to_le_bytes());
+        a
+    }
+
+    fn extension(names: &[(u64, u8, &str)], attrs: &[Vec<u8>]) -> Vec<u8> {
+        let mut rec = make_record(FLAG_IN_USE, names, attrs);
+        put(&mut rec, 0x20, &BASE_REF.to_le_bytes());
+        rec
+    }
+
+    #[test]
+    fn extension_record_carries_first_data_extent() {
+        let mut rec = extension(&[], &[extent_at(0, 8192, 5000)]);
+        let got = parse_any(&mut rec, 99);
+        assert_eq!(got, Some(Parsed::Extension(Extension { base: 40, data: Some((8192, 5000)), name: None })));
+    }
+
+    #[test]
+    fn extension_record_carries_file_name() {
+        let mut rec = extension(&[(5, NS_DOS, "DIR~1"), (PARENT, NS_WIN32, "directory")], &[]);
+        let got = parse_any(&mut rec, 99);
+        assert_eq!(got, Some(Parsed::Extension(Extension { base: 40, data: None, name: Some((5, "directory".into())) })));
+    }
+
+    #[test]
+    fn extension_with_only_a_later_extent_is_none() {
+        let mut rec = extension(&[], &[extent_at(64, 999, 999)]);
+        assert_eq!(parse_any(&mut rec, 99), None);
+    }
+
+    #[test]
+    fn base_takes_sizes_only_from_the_first_extent() {
+        let mut later_only = make_record(FLAG_IN_USE, &[(5, NS_WIN32, "frag.bin")], &[extent_at(64, 999, 999)]);
+        let r = parse_record(&mut later_only, 1).expect("record should parse");
+        assert_eq!((r.allocated, r.logical), (0, 0));
+
+        let attrs = [extent_at(64, 999, 999), extent_at(0, 8192, 5000)];
+        let mut both = make_record(FLAG_IN_USE, &[(5, NS_WIN32, "frag.bin")], &attrs);
+        let r = parse_record(&mut both, 1).expect("record should parse");
+        assert_eq!((r.allocated, r.logical), (8192, 5000));
+    }
+
+    #[test]
+    fn nameless_base_is_kept_for_merging_but_not_by_parse_record() {
+        let mut rec = make_record(FLAG_IN_USE | 0x02, &[], &[]);
+        let Some(Parsed::Base(r)) = parse_any(&mut rec.clone(), 3) else { panic!("expected a base record") };
+        assert!(r.name.is_empty() && r.is_dir);
+        assert!(parse_record(&mut rec, 3).is_none());
     }
 
     #[test]

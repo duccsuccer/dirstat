@@ -1,8 +1,9 @@
 //! Fast scanner: reads the NTFS Master File Table of a volume and rebuilds the folder tree from it.
 
 use crate::model::{NodeId, Tree, TreeBuilder};
-use crate::scan::mft_parse::{parse_record, MftRecord};
+use crate::scan::mft_parse::{parse_any, Extension, MftRecord, Parsed};
 use rayon::prelude::*;
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::mem::size_of;
 use std::os::windows::fs::{FileExt, OpenOptionsExt};
@@ -89,7 +90,7 @@ pub fn scan_volume(
     if cancel.load(Ordering::Relaxed) {
         return Err("scan cancelled".into());
     }
-    build_tree(records, &root_name(letter, subtree), &folder)
+    build_tree(merge_extensions(records), &root_name(letter, subtree), &folder)
 }
 
 /// Path components of `path` below the root of volume `letter`, with links and short names resolved.
@@ -185,7 +186,7 @@ fn read_records(
     align: usize,
     cancel: &AtomicBool,
     on_progress: &mut dyn FnMut(u64, u64),
-) -> Result<Vec<MftRecord>, String> {
+) -> Result<Vec<Parsed>, String> {
     let (files, bytes) = (AtomicU64::new(0), AtomicU64::new(0));
     let (files, bytes) = (&files, &bytes);
     let (done_tx, done_rx) = mpsc::channel::<()>();
@@ -200,11 +201,18 @@ fn read_records(
                         return Ok(Vec::new());
                     }
                     let recs = read_chunk(volume, chunk, record, align)?;
-                    files.fetch_add(recs.iter().filter(|r| !r.is_dir).count() as u64, Ordering::Relaxed);
-                    bytes.fetch_add(recs.iter().map(|r| r.allocated).sum(), Ordering::Relaxed);
+                    let (mut f, mut b) = (0, 0);
+                    for r in &recs {
+                        match r {
+                            Parsed::Base(r) => (f, b) = (f + u64::from(!r.is_dir), b + r.allocated),
+                            Parsed::Extension(e) => b += e.data.map_or(0, |(allocated, _)| allocated),
+                        }
+                    }
+                    files.fetch_add(f, Ordering::Relaxed);
+                    bytes.fetch_add(b, Ordering::Relaxed);
                     Ok(recs)
                 })
-                .collect::<Result<Vec<Vec<MftRecord>>, String>>()
+                .collect::<Result<Vec<Vec<Parsed>>, String>>()
         });
         while let Err(RecvTimeoutError::Timeout) = done_rx.recv_timeout(PROGRESS_EVERY) {
             on_progress(files.load(Ordering::Relaxed), bytes.load(Ordering::Relaxed));
@@ -216,7 +224,7 @@ fn read_records(
 }
 
 /// Reads one chunk into an `align`-aligned buffer and parses its records, numbered by MFT position.
-fn read_chunk(volume: &File, chunk: &Chunk, record: usize, align: usize) -> Result<Vec<MftRecord>, String> {
+fn read_chunk(volume: &File, chunk: &Chunk, record: usize, align: usize) -> Result<Vec<Parsed>, String> {
     let len: usize = chunk.pieces.iter().map(|p| p.len as usize).sum();
     let mut storage = vec![0u8; len + align];
     let start = storage.as_ptr().align_offset(align);
@@ -236,7 +244,7 @@ fn read_chunk(volume: &File, chunk: &Chunk, record: usize, align: usize) -> Resu
     Ok(buf
         .chunks_exact_mut(record)
         .zip(chunk.first_record..)
-        .filter_map(|(rec, index)| parse_record(rec, index))
+        .filter_map(|(rec, index)| parse_any(rec, index))
         .collect())
 }
 
@@ -247,6 +255,37 @@ fn root_name(letter: char, subtree: Option<&Path>) -> String {
     let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
     let name = absolute.to_string_lossy();
     name.strip_prefix(r"\\?\").unwrap_or(&name).trim_end_matches('\\').to_string()
+}
+
+/// Folds extension records into their base records: a file with no data of its own (both sizes 0) takes the
+/// sizes of the first `$DATA` extent held in an extension, and a base record with no `$FILE_NAME` of its own
+/// takes one held in an extension. Base records still nameless are dropped, as are extensions whose base record
+/// is not in use.
+fn merge_extensions(parsed: Vec<Parsed>) -> Vec<MftRecord> {
+    let mut records = Vec::with_capacity(parsed.len());
+    let mut extensions: HashMap<u64, Extension> = HashMap::new();
+    for p in parsed {
+        match p {
+            Parsed::Base(r) => records.push(r),
+            Parsed::Extension(e) => {
+                let merged = extensions.entry(e.base).or_default();
+                merged.data = merged.data.or(e.data);
+                merged.name = merged.name.take().or(e.name);
+            }
+        }
+    }
+    records.retain_mut(|r| {
+        if let Some(e) = extensions.get_mut(&r.index) {
+            if let (false, 0, 0, Some((allocated, logical))) = (r.is_dir, r.allocated, r.logical, e.data) {
+                (r.allocated, r.logical) = (allocated, logical);
+            }
+            if let (true, Some((parent, name))) = (r.name.is_empty(), e.name.take()) {
+                (r.parent, r.name) = (parent, name);
+            }
+        }
+        !r.name.is_empty()
+    });
+    records
 }
 
 /// Rebuilds the folder tree from parsed records, with its root named `root_name`. `folder` holds the path
@@ -447,6 +486,36 @@ mod tests {
         let t = build_tree(recs, "C:", &[]).unwrap();
         assert!(t.nodes.iter().any(|n| n.name == "\u{10348}.txt"));
         assert!(t.nodes.iter().any(|n| n.name == long));
+    }
+
+    fn ext(base: u64, data: Option<(u64, u64)>, name: Option<(u64, &str)>) -> Parsed {
+        Parsed::Extension(Extension { base, data, name: name.map(|(p, n)| (p, n.to_string())) })
+    }
+
+    #[test]
+    fn extension_data_fills_a_base_without_data() {
+        let parsed = vec![
+            Parsed::Base(rec(30, 5, "vm.vhdx", false, 0)),
+            ext(30, Some((1 << 30, 1_000_000_000)), None),
+            Parsed::Base(rec(31, 5, "own.bin", false, 4096)),
+            ext(31, Some((999, 999)), None),
+        ];
+        let t = build_tree(merge_extensions(parsed), "C:", &[]).unwrap();
+        let root = &t.nodes[t.root.0 as usize];
+        assert_eq!((root.size, root.logical), ((1 << 30) + 4096, 1_000_000_000 + 2048));
+    }
+
+    #[test]
+    fn extension_name_keeps_a_nameless_base_and_its_subtree() {
+        let parsed = vec![
+            Parsed::Base(rec(30, 0, "", true, 0)),
+            ext(30, None, Some((5, "big dir"))),
+            Parsed::Base(rec(31, 30, "inside.bin", false, 8)),
+            Parsed::Base(rec(32, 0, "", false, 1)),
+            ext(77, Some((5, 5)), Some((5, "orphan"))),
+        ];
+        let t = build_tree(merge_extensions(parsed), "C:", &[]).unwrap();
+        assert_eq!(paths(&t), ["C:", r"C:\big dir", r"C:\big dir\inside.bin"]);
     }
 
     fn pointers(starting_vcn: i64, extents: &[(i64, i64)]) -> Vec<u8> {

@@ -1,19 +1,23 @@
-//! Directory tree pane (top-left).
+//! Directory tree pane (top-left), and the table drawing it shares with the file-type pane.
 
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Shape, Stroke, TextStyle, Vec2};
 use crate::actions;
 use crate::app::AppState;
 use crate::model::{NodeId, Tree};
+use crate::ui_legend::color_for;
 use std::collections::HashSet;
 use std::path::Path;
 
 const INDENT: f32 = 16.0;
 const ARROW_W: f32 = 16.0;
+const ICON_W: f32 = 16.0;
 const CELL_PAD: f32 = 4.0;
-const SIZE_W: f32 = 110.0;
-const SHARE_W: f32 = 130.0;
-const BAR_W: f32 = 60.0;
-const LOGICAL_W: f32 = 110.0;
+/// Title and width of each column; the first takes the width the others leave.
+const COLUMNS: [(&str, f32); 7] =
+    [("Folder", 0.0), ("% of Parent", 100.0), ("Size", 80.0), ("Allocated", 80.0), ("Items", 80.0), ("Files", 80.0), ("Folders", 70.0)];
+/// The tree is ordered by size on disk, the Allocated column.
+const SORTED: usize = 3;
+const DIR_ICON: Color32 = Color32::from_rgb(230, 190, 60);
 
 enum Click {
     Select(NodeId),
@@ -28,42 +32,50 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
     let rows = visible_rows(tree, &state.expanded);
     let selected = state.selected;
     let expanded = &state.expanded;
-    let row_h = ui.text_style_height(&TextStyle::Body) + 4.0;
+    let row_h = row_height(ui);
+    let widths = COLUMNS.map(|(_, w)| w);
     let mut click = None;
     let mut menu = None;
 
-    header(ui, row_h);
+    header(ui, row_h, &COLUMNS, 0, SORTED);
     let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]);
     if state.scroll_to_selected {
         state.scroll_to_selected = false;
         if let Some(row) = selected.and_then(|id| rows.iter().position(|&(r, _)| r == id)) {
-            scroll = scroll.vertical_scroll_offset(row as f32 * (row_h + ui.spacing().item_spacing.y));
+            scroll = scroll.vertical_scroll_offset(row as f32 * row_h);
         }
     }
     scroll.show_rows(ui, row_h, rows.len(), |ui, range| {
-            for &(id, depth) in &rows[range] {
+            for (index, &(id, depth)) in rows.iter().enumerate().skip(range.start).take(range.len()) {
                 let node = &tree.nodes[id.0 as usize];
                 let expandable = node.is_dir && !node.children.is_empty();
                 let (rect, response) = ui.allocate_exact_size(Vec2::new(ui.available_width(), row_h), Sense::click());
-                let cols = columns(rect);
+                let cells = cells(rect, &widths, 0);
                 let arrow_rect = Rect::from_min_size(
-                    Pos2::new(cols.name.left() + depth as f32 * INDENT, rect.top()),
+                    Pos2::new(cells[0].left() + depth as f32 * INDENT, rect.top()),
                     Vec2::new(ARROW_W, row_h),
                 );
                 let color = ui.visuals().text_color();
                 let painter = ui.painter();
 
-                if selected == Some(id) {
-                    painter.rect_filled(rect, 0.0, ui.visuals().selection.bg_fill);
-                }
+                row_background(ui, rect, &cells, index, selected == Some(id));
                 if expandable {
                     arrow(painter, arrow_rect.center(), expanded.contains(&id), color);
                 }
                 let mid = rect.center().y;
-                label(painter, cols.name, Pos2::new(arrow_rect.right(), mid), &node.name, color);
-                label(painter, cols.size, Pos2::new(cols.size.left() + CELL_PAD, mid), &format_size(node.size), color);
-                share_bar(ui, painter, cols.share, tree.percent_of_parent(id), mid);
-                label(painter, cols.logical, Pos2::new(cols.logical.left() + CELL_PAD, mid), &format_size(node.logical), color);
+                let icon = Rect::from_center_size(Pos2::new(arrow_rect.right() + ICON_W / 2.0, mid), Vec2::new(12.0, 10.0));
+                painter.with_clip_rect(cells[0]).rect_filled(icon, 1.0, if node.is_dir { DIR_ICON } else { color_for(node.ext) });
+                let name_pos = Pos2::new(arrow_rect.right() + ICON_W + CELL_PAD, mid);
+                painter.with_clip_rect(cells[0]).text(name_pos, Align2::LEFT_CENTER, &node.name, FontId::default(), color);
+                share_bar(ui, painter, cells[1], tree.percent_of_parent(id));
+                text(painter, cells[2], &format_size(node.logical), Align2::RIGHT_CENTER, color);
+                text(painter, cells[3], &format_size(node.size), Align2::RIGHT_CENTER, color);
+                if node.is_dir {
+                    let (files, folders) = (u64::from(node.files), u64::from(node.folders));
+                    text(painter, cells[4], &format_count(files + folders), Align2::RIGHT_CENTER, color);
+                    text(painter, cells[5], &format_count(files), Align2::RIGHT_CENTER, color);
+                    text(painter, cells[6], &format_count(folders), Align2::RIGHT_CENTER, color);
+                }
 
                 if response.clicked() {
                     let on_arrow = expandable && response.interact_pointer_pos().is_some_and(|p| arrow_rect.contains(p));
@@ -194,48 +206,90 @@ pub fn format_size(bytes: u64) -> String {
     format!("{value:.1} {}", UNITS[unit])
 }
 
-struct Columns {
-    name: Rect,
-    size: Rect,
-    share: Rect,
-    logical: Rect,
+/// `n` with thousands separators, e.g. `2,541,851`.
+pub fn format_count(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, digit) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
 }
 
-/// Splits a row into its columns; the name column takes the space the fixed-width columns leave.
-fn columns(row: Rect) -> Columns {
-    let logical = Rect::from_min_max(Pos2::new(row.right() - LOGICAL_W, row.top()), row.right_bottom());
-    let share = Rect::from_min_max(Pos2::new(logical.left() - SHARE_W, row.top()), Pos2::new(logical.left(), row.bottom()));
-    let size = Rect::from_min_max(Pos2::new(share.left() - SIZE_W, row.top()), Pos2::new(share.left(), row.bottom()));
-    let name = Rect::from_min_max(row.left_top(), Pos2::new(size.left(), row.bottom()));
-    Columns { name, size, share, logical }
+/// Height of one compact table row.
+pub(crate) fn row_height(ui: &mut egui::Ui) -> f32 {
+    // Rows sit edge to edge so the striping has no gaps.
+    ui.spacing_mut().item_spacing.y = 0.0;
+    ui.text_style_height(&TextStyle::Body) + 4.0
 }
 
-fn header(ui: &mut egui::Ui, row_h: f32) {
+/// Splits `row` into one cell per width; column `flex` takes whatever the other widths leave.
+pub(crate) fn cells(row: Rect, widths: &[f32], flex: usize) -> Vec<Rect> {
+    let fixed: f32 = widths.iter().enumerate().filter(|&(i, _)| i != flex).map(|(_, w)| w).sum();
+    let mut x = row.left();
+    widths
+        .iter()
+        .enumerate()
+        .map(|(i, &w)| {
+            let w = if i == flex { (row.width() - fixed).max(0.0) } else { w };
+            let cell = Rect::from_min_max(Pos2::new(x, row.top()), Pos2::new(x + w, row.bottom()));
+            x += w;
+            cell
+        })
+        .collect()
+}
+
+/// Column titles with grid lines; column `sorted` gets a down arrow, as the rows are ordered by it.
+pub(crate) fn header(ui: &mut egui::Ui, row_h: f32, columns: &[(&str, f32)], flex: usize, sorted: usize) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), row_h), Sense::hover());
-    let cols = columns(rect);
+    let widths: Vec<f32> = columns.iter().map(|&(_, w)| w).collect();
+    let cells = cells(rect, &widths, flex);
     let color = ui.visuals().strong_text_color();
-    let mid = rect.center().y;
     let painter = ui.painter();
-    label(painter, cols.name, Pos2::new(cols.name.left() + ARROW_W, mid), "Name", color);
-    label(painter, cols.size, Pos2::new(cols.size.left() + CELL_PAD, mid), "Size on disk", color);
-    label(painter, cols.share, Pos2::new(cols.share.left() + CELL_PAD, mid), "% of parent", color);
-    label(painter, cols.logical, Pos2::new(cols.logical.left() + CELL_PAD, mid), "Logical size", color);
+    painter.rect_filled(rect, 0.0, ui.visuals().faint_bg_color);
+    for (i, (cell, (title, _))) in cells.iter().zip(columns).enumerate() {
+        text(painter, *cell, title, Align2::LEFT_CENTER, color);
+        if i == sorted {
+            arrow(painter, Pos2::new(cell.right() - 10.0, cell.center().y), true, color);
+        }
+        grid_line(ui, painter, *cell);
+    }
 }
 
-fn label(painter: &egui::Painter, clip: Rect, pos: Pos2, text: &str, color: Color32) {
-    painter.with_clip_rect(clip).text(pos, Align2::LEFT_CENTER, text, FontId::default(), color);
+/// Selection highlight or the stripe of every other row, then the column grid lines.
+pub(crate) fn row_background(ui: &egui::Ui, row: Rect, cells: &[Rect], index: usize, selected: bool) {
+    let painter = ui.painter();
+    if selected {
+        painter.rect_filled(row, 0.0, ui.visuals().selection.bg_fill);
+    } else if index % 2 == 1 {
+        painter.rect_filled(row, 0.0, ui.visuals().faint_bg_color);
+    }
+    for cell in cells {
+        grid_line(ui, painter, *cell);
+    }
 }
 
-fn share_bar(ui: &egui::Ui, painter: &egui::Painter, cell: Rect, percent: f32, mid: f32) {
-    let bar = Rect::from_min_size(Pos2::new(cell.left() + CELL_PAD, mid - 4.0), Vec2::new(BAR_W, 8.0));
-    painter.rect_filled(bar, 2.0, ui.visuals().extreme_bg_color);
+fn grid_line(ui: &egui::Ui, painter: &egui::Painter, cell: Rect) {
+    let stroke = Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color);
+    painter.vline(cell.right() - 0.5, cell.y_range(), stroke);
+}
+
+/// `s` in `cell`, clipped to it, against its left or right edge.
+pub(crate) fn text(painter: &egui::Painter, cell: Rect, s: &str, align: Align2, color: Color32) {
+    let x = if align == Align2::RIGHT_CENTER { cell.right() - CELL_PAD } else { cell.left() + CELL_PAD };
+    painter.with_clip_rect(cell).text(Pos2::new(x, cell.center().y), align, s, FontId::default(), color);
+}
+
+/// A bar filled to `percent` of the cell, with the number over it.
+pub(crate) fn share_bar(ui: &egui::Ui, painter: &egui::Painter, cell: Rect, percent: f32) {
+    let bar = cell.shrink2(Vec2::new(CELL_PAD, 2.0));
+    painter.rect_filled(bar, 0.0, ui.visuals().extreme_bg_color);
     let filled = (percent / 100.0).clamp(0.0, 1.0);
-    painter.rect_filled(
-        Rect::from_min_size(bar.min, Vec2::new(BAR_W * filled, 8.0)),
-        2.0,
-        ui.visuals().hyperlink_color,
-    );
-    label(painter, cell, Pos2::new(bar.right() + CELL_PAD, mid), &format!("{percent:.1}%"), ui.visuals().text_color());
+    painter.rect_filled(Rect::from_min_size(bar.min, Vec2::new(bar.width() * filled, bar.height())), 0.0, Color32::from_gray(95));
+    text(painter, cell, &format!("{percent:.1} %"), Align2::RIGHT_CENTER, ui.visuals().text_color());
 }
 
 /// Expander triangle: pointing right when collapsed, down when open.
@@ -313,6 +367,29 @@ mod tests {
 
         assert_eq!(rows.len(), 1002);
         assert_eq!(rows.last().unwrap().1, 1001);
+    }
+
+    #[test]
+    fn format_count_groups_thousands() {
+        assert_eq!(format_count(0), "0");
+        assert_eq!(format_count(999), "999");
+        assert_eq!(format_count(1000), "1,000");
+        assert_eq!(format_count(2_541_851), "2,541,851");
+        assert_eq!(format_count(u64::from(u32::MAX)), "4,294,967,295");
+    }
+
+    #[test]
+    fn cells_give_the_flex_column_the_rest() {
+        let row = Rect::from_min_size(Pos2::new(10.0, 0.0), Vec2::new(300.0, 20.0));
+        let c = cells(row, &[0.0, 100.0, 50.0], 0);
+        assert_eq!((c[0].left(), c[0].width()), (10.0, 150.0));
+        assert_eq!((c[1].left(), c[1].width()), (160.0, 100.0));
+        assert_eq!((c[2].left(), c[2].right()), (260.0, 310.0));
+        let c = cells(row, &[20.0, 0.0, 50.0], 1);
+        assert_eq!((c[1].left(), c[1].width()), (30.0, 230.0));
+        // Too narrow: the flex column shrinks to nothing, never below.
+        let c = cells(row, &[0.0, 400.0], 0);
+        assert_eq!(c[0].width(), 0.0);
     }
 
     #[test]

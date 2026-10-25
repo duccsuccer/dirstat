@@ -5,9 +5,10 @@ use crate::actions::{self, DeleteOutcome};
 use crate::model::{NodeId, Tree};
 use crate::scan::{self, ScanEvent, ScanHandle, ScanMode, ScanTarget};
 use crate::{ui_legend, ui_tree, ui_treemap::{self, TreemapCache}};
-use std::collections::HashSet;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
+use std::time::Instant;
 
 pub struct AppState {
     pub tree: Option<Tree>,
@@ -29,6 +30,13 @@ pub struct AppState {
     pub pending_permanent: Option<NodeId>,
     /// Why the last delete did not happen; shown in a dialog until dismissed.
     pub delete_notice: Option<String>,
+    /// (total, free) bytes of the volume holding the scan target, read when the scan starts.
+    pub disk: Option<(u64, u64)>,
+    pub scan_started: Option<Instant>,
+    /// How long the last finished scan took.
+    pub scan_secs: Option<f32>,
+    /// File type names the shell gave for each extension, so it is asked once per extension.
+    pub type_names: HashMap<String, String>,
 }
 
 impl Default for AppState {
@@ -56,6 +64,10 @@ impl AppState {
             pending_delete: None,
             pending_permanent: None,
             delete_notice: None,
+            disk: None,
+            scan_started: None,
+            scan_secs: None,
+            type_names: HashMap::new(),
         }
     }
 
@@ -71,6 +83,11 @@ impl AppState {
 
     pub fn begin_scan(&mut self, target: ScanTarget, ctx: &egui::Context) {
         let tx = self.install_channel();
+        self.disk = disk_space(&match &target {
+            ScanTarget::Volume(letter) => PathBuf::from(format!(r"{letter}:\")),
+            ScanTarget::Folder(path) => path.clone(),
+        });
+        (self.scan_started, self.scan_secs) = (Some(Instant::now()), None);
         let ctx = ctx.clone();
         self.scan = Some(scan::start(target.clone(), tx, Box::new(move || ctx.request_repaint())));
         self.target = Some(target);
@@ -139,6 +156,7 @@ impl AppState {
                     self.mode = Some(mode);
                     self.skipped = skipped;
                     self.scan = None;
+                    self.scan_secs = self.scan_started.map(|t| t.elapsed().as_secs_f32());
                 }
                 ScanEvent::Failed(message) => {
                     self.error = Some(message);
@@ -156,14 +174,23 @@ impl eframe::App for AppState {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         egui::Panel::top("top_bar").show(ui, |ui| top_bar(ui, self));
-        let treemap_height = ui.ctx().content_rect().height() * 0.45;
+        egui::Panel::top("tabs").show(ui, |ui| {
+            // Only one view exists; the tab is there for the familiar layout.
+            let _ = ui.selectable_label(true, "Tree View");
+        });
+        egui::Panel::bottom("status").show(ui, |ui| {
+            if let Some(tree) = &self.tree {
+                ui.label(selection_status(tree, self.selected.unwrap_or(tree.root)));
+            }
+        });
+        let treemap_height = ui.ctx().content_rect().height() * 0.4;
         egui::Panel::bottom("treemap")
             .resizable(true)
             .default_size(treemap_height)
             .show(ui, |ui| ui_treemap::show(ui, self));
         egui::Panel::right("legend")
             .resizable(true)
-            .default_size(240.0)
+            .default_size(500.0)
             .show(ui, |ui| ui_legend::show(ui, self));
         egui::CentralPanel::default().show(ui, |ui| {
             if self.target.is_none() {
@@ -248,49 +275,141 @@ fn dialog(title: &str) -> egui::Window<'_> {
     egui::Window::new(title).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
 }
 
+/// Dark, compact look: near-black panels, faint row stripes, blue selection.
+pub fn apply_theme(ctx: &egui::Context) {
+    ctx.set_theme(egui::Theme::Dark);
+    ctx.style_mut_of(egui::Theme::Dark, |style| {
+        let visuals = &mut style.visuals;
+        visuals.panel_fill = egui::Color32::from_gray(24);
+        visuals.window_fill = egui::Color32::from_gray(30);
+        visuals.extreme_bg_color = egui::Color32::from_gray(14);
+        visuals.faint_bg_color = egui::Color32::from_gray(32);
+        visuals.selection.bg_fill = egui::Color32::from_rgb(0, 90, 158);
+        visuals.widgets.noninteractive.bg_stroke.color = egui::Color32::from_gray(48);
+    });
+}
+
+/// Width of the top bar's left block: drive picker, buttons, status and progress bar.
+const CONTROLS_W: f32 = 420.0;
+
 fn top_bar(ui: &mut egui::Ui, state: &mut AppState) {
     let drive_id = egui::Id::unique("drive_choice");
     let mut choice: Option<char> = ui.data(|d| d.get_temp(drive_id)).flatten();
     ui.horizontal(|ui| {
-        egui::ComboBox::from_id_salt("drive")
-            .selected_text(choice.map_or("Drive".to_string(), |letter| format!("{letter}:")))
-            .show_ui(ui, |ui| {
-                for letter in logical_drives() {
-                    ui.selectable_value(&mut choice, Some(letter), format!("{letter}:"));
+        ui.vertical(|ui| {
+            ui.set_width(CONTROLS_W);
+            ui.horizontal(|ui| {
+                ui.label("Select:");
+                egui::ComboBox::from_id_salt("drive")
+                    .selected_text(choice.map_or("Drive".to_string(), |letter| format!("{letter}:")))
+                    .show_ui(ui, |ui| {
+                        for letter in logical_drives() {
+                            ui.selectable_value(&mut choice, Some(letter), format!("{letter}:"));
+                        }
+                    });
+                if ui.add_enabled(choice.is_some(), egui::Button::new("Scan")).clicked() {
+                    if let Some(letter) = choice {
+                        state.begin_scan(ScanTarget::Volume(letter), ui.ctx());
+                    }
+                }
+                if ui.button("Browse folder").clicked() {
+                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                        state.begin_scan(ScanTarget::Folder(path), ui.ctx());
+                    }
+                }
+                if ui.add_enabled(state.target.is_some(), egui::Button::new("Rescan")).clicked() {
+                    if let Some(target) = state.target.clone() {
+                        state.begin_scan(target, ui.ctx());
+                    }
                 }
             });
-        if ui.add_enabled(choice.is_some(), egui::Button::new("Scan")).clicked() {
-            if let Some(letter) = choice {
-                state.begin_scan(ScanTarget::Volume(letter), ui.ctx());
+            ui.label(status_text(state));
+            let fraction = progress_fraction(state);
+            ui.add(egui::ProgressBar::new(fraction.unwrap_or(0.0)).desired_height(12.0).animate(fraction.is_none()));
+        });
+        ui.separator();
+        egui::Grid::new("disk_info").num_columns(2).spacing([24.0, 2.0]).show(ui, |ui| {
+            let selection = state.tree.as_ref().map(|t| actions::shell_path(t.path(state.selected.unwrap_or(t.root))));
+            ui.label("Selection:");
+            ui.strong(selection.unwrap_or_default());
+            ui.end_row();
+            for (name, value) in disk_lines(state.disk) {
+                ui.label(name);
+                ui.strong(value);
+                ui.end_row();
             }
-        }
-        if ui.button("Browse folder").clicked() {
-            if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                state.begin_scan(ScanTarget::Folder(path), ui.ctx());
-            }
-        }
-        if ui.add_enabled(state.target.is_some(), egui::Button::new("Rescan")).clicked() {
-            if let Some(target) = state.target.clone() {
-                state.begin_scan(target, ui.ctx());
-            }
-        }
-        if let Some(mode) = state.mode {
-            ui.label(match mode {
-                ScanMode::Mft => "Fast (MFT)",
-                ScanMode::Walk => "Fallback (walk)",
-            });
-        }
-        if let Some(text) = skipped_label(state) {
-            ui.label(text);
-        }
-        if state.scan.is_some() {
-            ui.label(progress_label(state.progress));
-        }
+        });
     });
     ui.data_mut(|d| d.insert_temp(drive_id, choice));
     if let Some(error) = &state.error {
         ui.colored_label(egui::Color32::RED, error);
     }
+}
+
+/// The line over the progress bar: live counters while scanning, then how the last scan went.
+fn status_text(state: &AppState) -> String {
+    if state.scan.is_some() {
+        return progress_label(state.progress);
+    }
+    let Some(mode) = state.mode.filter(|_| state.tree.is_some()) else { return String::new() };
+    let mut text = match state.scan_secs {
+        Some(secs) => format!("Scan complete in {secs:.2} seconds"),
+        None => "Scan complete".to_string(),
+    };
+    text += match mode {
+        ScanMode::Mft => " (fast, MFT)",
+        ScanMode::Walk => " (fallback walk)",
+    };
+    if let Some(skipped) = skipped_label(state) {
+        text += &format!("; {skipped}");
+    }
+    text
+}
+
+/// Progress bar fill: while a whole volume scans, bytes found against the volume's used space (`None`, an animated
+/// bar, when that is unknown or the target is a folder); full once a tree is shown.
+fn progress_fraction(state: &AppState) -> Option<f32> {
+    if state.scan.is_none() {
+        return Some(if state.tree.is_some() { 1.0 } else { 0.0 });
+    }
+    let (total, free) = state.disk.filter(|_| matches!(state.target, Some(ScanTarget::Volume(_))))?;
+    let used = total.saturating_sub(free);
+    // The files never quite reach used space (metadata), so the bar stops short until the scan is done.
+    (used > 0).then(|| (state.progress.1 as f32 / used as f32).min(0.99))
+}
+
+/// The "Total space", "Space used" and "Space free" rows of the info block, the last two with their share of the total.
+fn disk_lines(disk: Option<(u64, u64)>) -> [(&'static str, String); 3] {
+    let Some((total, free)) = disk else {
+        return [("Total space:", "-".into()), ("Space used:", "-".into()), ("Space free:", "-".into())];
+    };
+    let used = total.saturating_sub(free);
+    let with_share = |n: u64| {
+        let share = if total == 0 { 0.0 } else { n as f64 * 100.0 / total as f64 };
+        format!("{}  ({share:.1}%)", ui_tree::format_size(n))
+    };
+    [("Total space:", ui_tree::format_size(total)), ("Space used:", with_share(used)), ("Space free:", with_share(free))]
+}
+
+/// The status line under the treemap for item `id`: how many files it holds (1 for a file), its logical size and
+/// its size on disk.
+pub fn selection_status(tree: &Tree, id: NodeId) -> String {
+    let node = &tree.nodes[id.0 as usize];
+    let files = if node.is_dir { u64::from(node.files) } else { 1 };
+    format!(
+        "Selected Files: {}    Total Size: {}    Allocated: {}",
+        ui_tree::format_count(files),
+        ui_tree::format_size(node.logical),
+        ui_tree::format_size(node.size)
+    )
+}
+
+/// (total, free) bytes of the volume holding `path`, as Explorer shows them; `None` when they cannot be read.
+fn disk_space(path: &Path) -> Option<(u64, u64)> {
+    use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    let (mut total, mut free) = (0u64, 0u64);
+    unsafe { GetDiskFreeSpaceExW(&windows::core::HSTRING::from(path), None, Some(&mut total), Some(&mut free)) }.ok()?;
+    Some((total, free))
 }
 
 /// Tells the user the totals miss what the walk could not read; only once a tree is shown.
@@ -429,6 +548,7 @@ mod tests {
             blocks: Vec::new(),
             mesh: Default::default(),
             origin: egui::Pos2::ZERO,
+            dirs: Vec::new(),
             highlight_for: None,
             highlight: Default::default(),
         });
@@ -513,6 +633,76 @@ mod tests {
         assert_eq!(skipped_label(&state).as_deref(), Some("3 items could not be read"));
         state.skipped = 0;
         assert_eq!(skipped_label(&state), None);
+    }
+
+    #[test]
+    fn done_event_records_scan_time() {
+        let mut state = AppState::new();
+        let tx = state.install_channel();
+        state.scan_started = Some(Instant::now());
+        tx.send(ScanEvent::Done { tree: tree(), mode: ScanMode::Mft, skipped: 0 }).unwrap();
+        state.pump();
+        assert!(state.scan_secs.is_some_and(|s| s >= 0.0));
+        assert!(status_text(&state).starts_with("Scan complete in "), "{}", status_text(&state));
+    }
+
+    #[test]
+    fn status_text_follows_the_scan() {
+        let mut state = AppState::new();
+        assert_eq!(status_text(&state), "");
+        state.scan = Some(ScanHandle::detached());
+        state.progress = (12, 1536);
+        assert_eq!(status_text(&state), "Scanning: 12 files, 1.5 KB");
+        state.scan = None;
+        state.tree = Some(tree());
+        state.mode = Some(ScanMode::Walk);
+        state.skipped = 3;
+        assert_eq!(status_text(&state), "Scan complete (fallback walk); 3 items could not be read");
+    }
+
+    #[test]
+    fn progress_fraction_compares_bytes_with_used_space() {
+        let mut state = AppState::new();
+        assert_eq!(progress_fraction(&state), Some(0.0));
+        state.scan = Some(ScanHandle::detached());
+        state.target = Some(ScanTarget::Volume('C'));
+        assert_eq!(progress_fraction(&state), None);
+        state.disk = Some((1000, 600));
+        state.progress = (5, 100);
+        assert_eq!(progress_fraction(&state), Some(0.25));
+        state.progress = (5, 900);
+        assert_eq!(progress_fraction(&state), Some(0.99));
+        state.target = Some(ScanTarget::Folder(PathBuf::from(r"C:\x")));
+        assert_eq!(progress_fraction(&state), None);
+        state.scan = None;
+        state.tree = Some(tree());
+        assert_eq!(progress_fraction(&state), Some(1.0));
+    }
+
+    #[test]
+    fn disk_lines_show_used_and_free_shares() {
+        let gb = 1024 * 1024 * 1024;
+        let lines = disk_lines(Some((1000 * gb, 250 * gb)));
+        assert_eq!(lines[0], ("Total space:", "1000.0 GB".to_string()));
+        assert_eq!(lines[1], ("Space used:", "750.0 GB  (75.0%)".to_string()));
+        assert_eq!(lines[2], ("Space free:", "250.0 GB  (25.0%)".to_string()));
+        assert_eq!(disk_lines(None)[1].1, "-");
+        assert_eq!(disk_lines(Some((0, 0)))[1].1, "0 B  (0.0%)");
+    }
+
+    #[test]
+    fn selection_status_counts_files_and_both_sizes() {
+        let (state, a, f) = state_with_file();
+        let tree = state.tree.as_ref().unwrap();
+        assert_eq!(selection_status(tree, tree.root), "Selected Files: 2    Total Size: 17 B    Allocated: 17 B");
+        assert_eq!(selection_status(tree, a), "Selected Files: 1    Total Size: 10 B    Allocated: 10 B");
+        assert_eq!(selection_status(tree, f), "Selected Files: 1    Total Size: 10 B    Allocated: 10 B");
+    }
+
+    #[test]
+    fn disk_space_reads_the_temp_volume() {
+        let (total, free) = disk_space(&std::env::temp_dir()).unwrap();
+        assert!(total > 0 && free <= total);
     }
 
     #[test]

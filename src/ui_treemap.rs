@@ -1,22 +1,28 @@
 //! Treemap pane (bottom).
 
-use eframe::egui::{self, Color32, Mesh, Pos2, Sense, Shape, Vec2};
+use eframe::egui::{self, Align2, Color32, FontId, Mesh, Pos2, Sense, Shape, Vec2};
 use crate::app::AppState;
 use crate::model::{NodeId, Tree};
 use crate::treemap;
 use crate::ui_legend::color_for;
+use crate::actions::shell_path;
 use crate::ui_tree::{apply_menu_action, ensure_visible, format_size, item_menu, placeholder};
 use std::sync::Arc;
 
 /// Above this many selected blocks the outline is one bounding box, so a huge selection costs no more than a small one.
 const HIGHLIGHT_LIMIT: usize = 2000;
 const OUTLINE_W: f32 = 2.0;
+/// Height of the name strip at the top of a large folder.
+const HEADER_H: f32 = 14.0;
+const DIR_FILL: Color32 = Color32::from_gray(52);
 
 /// Layout of the pane at one size. Both meshes are kept in absolute screen coordinates, placed at `origin`.
 /// `highlight` outlines the selection and is refreshed only when `selected` changes.
 pub struct TreemapCache {
     pub size: (f32, f32),
     pub blocks: Vec<(NodeId, treemap::Rect)>,
+    /// Folders drawn as a frame with their name in a strip at the top, each before its subfolders.
+    pub dirs: Vec<(NodeId, treemap::Rect)>,
     pub mesh: Arc<Mesh>,
     pub origin: Pos2,
     pub highlight_for: Option<NodeId>,
@@ -26,17 +32,18 @@ pub struct TreemapCache {
 impl TreemapCache {
     fn new(tree: &Tree, size: (f32, f32)) -> Self {
         let bounds = treemap::Rect { x: 0.0, y: 0.0, w: size.0, h: size.1 };
-        let blocks = treemap::layout(tree, tree.root, bounds);
+        let (blocks, dirs) = treemap::layout_with_headers(tree, tree.root, bounds, HEADER_H);
         let mut mesh = Mesh::default();
+        for (_, d) in &dirs {
+            mesh.add_colored_rect(to_egui(d, Pos2::ZERO), DIR_FILL);
+        }
         for (id, b) in &blocks {
-            mesh.add_colored_rect(
-                egui::Rect::from_min_size(Pos2::new(b.x, b.y), Vec2::new(b.w, b.h)),
-                color_for(tree.nodes[id.0 as usize].ext),
-            );
+            add_shaded_rect(&mut mesh, to_egui(b, Pos2::ZERO), color_for(tree.nodes[id.0 as usize].ext));
         }
         Self {
             size,
             blocks,
+            dirs,
             mesh: Arc::new(mesh),
             origin: Pos2::ZERO,
             highlight_for: None,
@@ -60,6 +67,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
         placeholder(ui, state);
         return;
     };
+    ui.vertical_centered(|ui| ui.strong(shell_path(tree.path(tree.root))));
     let size = ui.available_size();
     let (response, painter) = ui.allocate_painter(size, Sense::click());
     let origin = response.rect.min;
@@ -71,15 +79,34 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
     let cache = state.treemap_cache.get_or_insert_with(|| TreemapCache::new(tree, size));
     cache.place(origin);
     if cache.highlight_for != state.selected {
-        let rects = state.selected.map_or_else(Vec::new, |id| blocks_under(tree, &cache.blocks, id));
+        // A framed folder is outlined as one box, anything else block by block.
+        let rects = state.selected.map_or_else(Vec::new, |id| match cache.dirs.iter().find(|&&(d, _)| d == id) {
+            Some(&(_, r)) => vec![r],
+            None => blocks_under(tree, &cache.blocks, id),
+        });
         cache.highlight = Arc::new(outline_mesh(&highlight_outline_rects(&rects), origin));
         cache.highlight_for = state.selected;
     }
 
     painter.add(Shape::Mesh(Arc::clone(&cache.mesh)));
+    for (id, d) in &cache.dirs {
+        let node = &tree.nodes[id.0 as usize];
+        let strip = egui::Rect::from_min_size(origin + Vec2::new(d.x + 3.0, d.y), Vec2::new(d.w - 4.0, HEADER_H));
+        painter.with_clip_rect(strip.intersect(response.rect)).text(
+            strip.left_center(),
+            Align2::LEFT_CENTER,
+            format!("{} ({})", node.name, format_size(node.size)),
+            FontId::proportional(11.0),
+            Color32::from_gray(225),
+        );
+    }
     painter.add(Shape::Mesh(Arc::clone(&cache.highlight)));
 
-    let hit = |pos: Pos2| hit_test(&cache.blocks, pos.x - origin.x, pos.y - origin.y);
+    // A file block, or else the innermost framed folder (its name strip or frame).
+    let hit = |pos: Pos2| {
+        let (x, y) = (pos.x - origin.x, pos.y - origin.y);
+        hit_test(&cache.blocks, x, y).or_else(|| hit_test(cache.dirs.iter().rev(), x, y))
+    };
     if response.clicked() || response.secondary_clicked() {
         if let Some(id) = response.interact_pointer_pos().and_then(hit) {
             state.selected = Some(id);
@@ -127,6 +154,25 @@ pub fn highlight_outline_rects(rects: &[treemap::Rect]) -> Vec<treemap::Rect> {
     vec![treemap::Rect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }]
 }
 
+fn to_egui(r: &treemap::Rect, origin: Pos2) -> egui::Rect {
+    egui::Rect::from_min_size(origin + Vec2::new(r.x, r.y), Vec2::new(r.w, r.h))
+}
+
+/// A block shaded like a cushion: lighter at the top left, darker at the bottom right.
+fn add_shaded_rect(mesh: &mut Mesh, r: egui::Rect, color: Color32) {
+    let scale = |f: f32| {
+        let c = |v: u8| (v as f32 * f).min(255.0) as u8;
+        Color32::from_rgb(c(color.r()), c(color.g()), c(color.b()))
+    };
+    let i = mesh.vertices.len() as u32;
+    mesh.colored_vertex(r.left_top(), scale(1.3));
+    mesh.colored_vertex(r.right_top(), color);
+    mesh.colored_vertex(r.left_bottom(), color);
+    mesh.colored_vertex(r.right_bottom(), scale(0.55));
+    mesh.add_triangle(i, i + 1, i + 2);
+    mesh.add_triangle(i + 1, i + 3, i + 2);
+}
+
 /// Four thin white edges per rect, in absolute coordinates for a pane at `origin`.
 fn outline_mesh(rects: &[treemap::Rect], origin: Pos2) -> Mesh {
     let mut mesh = Mesh::default();
@@ -147,9 +193,9 @@ fn outline_mesh(rects: &[treemap::Rect], origin: Pos2) -> Mesh {
 }
 
 /// The block containing (`x`, `y`), in the same local coordinates as `blocks`; `None` over a gap.
-pub fn hit_test(blocks: &[(NodeId, treemap::Rect)], x: f32, y: f32) -> Option<NodeId> {
+pub fn hit_test<'a>(blocks: impl IntoIterator<Item = &'a (NodeId, treemap::Rect)>, x: f32, y: f32) -> Option<NodeId> {
     blocks
-        .iter()
+        .into_iter()
         .find(|(_, r)| x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h)
         .map(|(id, _)| *id)
 }

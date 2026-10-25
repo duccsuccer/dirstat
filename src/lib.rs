@@ -10,7 +10,13 @@ pub mod ui_treemap;
 pub fn run() -> eframe::Result {
     eframe::run_native(
         "dirstat",
-        eframe::NativeOptions::default(),
-        Box::new(|_cc| Ok(Box::new(app::AppState::new()))),
+        eframe::NativeOptions {
+            viewport: eframe::egui::ViewportBuilder::default().with_inner_size([1400.0, 860.0]),
+            ..Default::default()
+        },
+        Box::new(|cc| {
+            app::apply_theme(&cc.egui_ctx);
+            Ok(Box::new(app::AppState::new()))
+        }),
     )
 }

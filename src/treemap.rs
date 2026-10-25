@@ -10,12 +10,31 @@ pub struct Rect {
     pub h: f32,
 }
 
+/// Nodes with the rect each is drawn in.
+pub type Rects = Vec<(NodeId, Rect)>;
+
+/// Narrowest folder rect that gets a header strip.
+const MIN_HEADER_W: f32 = 40.0;
+
 /// Returns one rect per drawn file block. Directories are subdivided by size and never drawn.
 pub fn layout(tree: &Tree, root: NodeId, bounds: Rect) -> Vec<(NodeId, Rect)> {
+    layout_with_headers(tree, root, bounds, 0.0).0
+}
+
+/// Like [`layout`], but a folder rect at least `MIN_HEADER_W` wide and three headers high keeps a `header`-high strip
+/// at its top for its name; its children fill the rest, one pixel in from the left, right and bottom edges, so the
+/// folder shows as a frame. Returns the file blocks and the folders that got a strip, each folder before its
+/// subfolders. A `header` of 0 gives no strips.
+pub fn layout_with_headers(tree: &Tree, root: NodeId, bounds: Rect, header: f32) -> (Rects, Rects) {
     let mut out = Vec::new();
+    let mut dirs = Vec::new();
     // Explicit stack instead of recursion, so deep directory chains cannot overflow the call stack.
     let mut stack = vec![(root, bounds)];
-    while let Some((dir, rect)) = stack.pop() {
+    while let Some((dir, mut rect)) = stack.pop() {
+        if header > 0.0 && rect.w >= MIN_HEADER_W && rect.h >= 3.0 * header {
+            dirs.push((dir, rect));
+            rect = Rect { x: rect.x + 1.0, y: rect.y + header, w: rect.w - 2.0, h: rect.h - header - 1.0 };
+        }
         let children: Vec<NodeId> = tree.nodes[dir.0 as usize]
             .children
             .iter()
@@ -42,7 +61,7 @@ pub fn layout(tree: &Tree, root: NodeId, bounds: Rect) -> Vec<(NodeId, Rect)> {
             }
         }
     }
-    out
+    (out, dirs)
 }
 
 fn area(r: Rect) -> f32 {
@@ -195,6 +214,28 @@ mod tests {
         assert!((area(rect_of(&tree, &blocks, "c.bin")) - 5000.0).abs() <= 50.0);
         assert!((area(rect_of(&tree, &blocks, "a.bin")) - 2500.0).abs() <= 25.0);
         assert!((area(rect_of(&tree, &blocks, "b.bin")) - 2500.0).abs() <= 25.0);
+    }
+
+    #[test]
+    fn large_folders_get_a_header_strip_above_their_children() {
+        let mut b = TreeBuilder::new("root");
+        let big = b.add(NodeId(0), "big", true, 0, 0);
+        b.add(big, "a.bin", false, 90, 90);
+        let tiny = b.add(NodeId(0), "tiny", true, 0, 0);
+        b.add(tiny, "t.bin", false, 1, 1);
+        let tree = b.finish();
+
+        let (blocks, dirs) = layout_with_headers(&tree, tree.root, BOUNDS, 10.0);
+
+        // Root and "big" are large enough; "tiny" (about 1 percent of the area) is not.
+        let ids: Vec<NodeId> = dirs.iter().map(|&(id, _)| id).collect();
+        assert_eq!(ids, [tree.root, big]);
+        let big_rect = dirs[1].1;
+        assert!(big_rect.y >= 10.0, "the root's strip stays free: {big_rect:?}");
+        let a = rect_of(&tree, &blocks, "a.bin");
+        assert!((a.y - (big_rect.y + 10.0)).abs() < EPS, "{a:?} starts below the strip of {big_rect:?}");
+        assert!((a.x - (big_rect.x + 1.0)).abs() < EPS && (a.w - (big_rect.w - 2.0)).abs() < EPS);
+        assert!(layout_with_headers(&tree, tree.root, BOUNDS, 0.0).1.is_empty());
     }
 
     #[test]

@@ -16,12 +16,24 @@ pub struct Node {
     pub logical: u64,
     pub ext: u16,
     pub children: Vec<NodeId>,
+    /// Files and folders below this node (itself not counted); 0 for a file.
+    pub files: u32,
+    pub folders: u32,
+}
+
+impl Node {
+    /// (files, folders) this node adds to each ancestor: everything below it plus itself.
+    fn counts_with_self(&self) -> (u32, u32) {
+        (self.files + u32::from(!self.is_dir), self.folders + u32::from(self.is_dir))
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct ExtStat {
     pub ext: String,
+    /// Size on disk.
     pub size: u64,
+    pub logical: u64,
     pub count: u64,
 }
 
@@ -58,6 +70,8 @@ impl TreeBuilder {
             logical: 0,
             ext: NO_EXT,
             children: Vec::new(),
+            files: 0,
+            folders: 0,
         };
         TreeBuilder { nodes: vec![root], ext_ids: HashMap::new(), other_id: None, exts: Vec::new() }
     }
@@ -70,6 +84,7 @@ impl TreeBuilder {
             let ext = self.intern_ext(name);
             let stat = &mut self.exts[ext as usize];
             stat.size += size;
+            stat.logical += logical;
             stat.count += 1;
             (size, logical, ext)
         };
@@ -81,6 +96,8 @@ impl TreeBuilder {
             logical,
             ext,
             children: Vec::new(),
+            files: 0,
+            folders: 0,
         });
         self.nodes[parent.0 as usize].children.push(id);
         id
@@ -93,7 +110,7 @@ impl TreeBuilder {
         }
         if self.exts.len() < OTHER_EXT_ID as usize {
             let id = self.exts.len() as u16;
-            self.exts.push(ExtStat { ext: ext.clone(), size: 0, count: 0 });
+            self.exts.push(ExtStat { ext: ext.clone(), size: 0, logical: 0, count: 0 });
             self.ext_ids.insert(ext, id);
             return id;
         }
@@ -102,7 +119,7 @@ impl TreeBuilder {
             Some(id) => id,
             None => {
                 let id = self.exts.len() as u16;
-                self.exts.push(ExtStat { ext: "(other)".to_string(), size: 0, count: 0 });
+                self.exts.push(ExtStat { ext: "(other)".to_string(), size: 0, logical: 0, count: 0 });
                 self.other_id = Some(id);
                 id
             }
@@ -114,9 +131,12 @@ impl TreeBuilder {
         for i in (1..self.nodes.len()).rev() {
             if let Some(p) = self.nodes[i].parent {
                 let (size, logical) = (self.nodes[i].size, self.nodes[i].logical);
+                let (files, folders) = self.nodes[i].counts_with_self();
                 let parent = &mut self.nodes[p.0 as usize];
                 parent.size += size;
                 parent.logical += logical;
+                parent.files += files;
+                parent.folders += folders;
             }
         }
 
@@ -164,6 +184,7 @@ impl Tree {
         let node = &self.nodes[id.0 as usize];
         let Some(parent) = node.parent else { return };
         let (size, logical) = (node.size, node.logical);
+        let (files, folders) = node.counts_with_self();
 
         self.nodes[parent.0 as usize].children.retain(|&c| c != id);
         self.nodes[id.0 as usize].parent = None;
@@ -173,6 +194,8 @@ impl Tree {
             let ancestor = &mut self.nodes[c.0 as usize];
             ancestor.size -= size;
             ancestor.logical -= logical;
+            ancestor.files -= files;
+            ancestor.folders -= folders;
             cur = ancestor.parent;
         }
 
@@ -184,6 +207,7 @@ impl Tree {
             } else {
                 let stat = &mut self.exts[node.ext as usize];
                 stat.size -= node.size;
+                stat.logical -= node.logical;
                 stat.count -= 1;
             }
         }
@@ -200,7 +224,7 @@ impl Tree {
         }
         // Keep `exts` ranked by size as `finish` leaves them: insert at the new stat's rank, shift the ids below it.
         let rank = self.exts.partition_point(|e| e.size >= extra) as u16;
-        self.exts.insert(rank as usize, ExtStat { ext: UNACCOUNTED.to_string(), size: extra, count: 1 });
+        self.exts.insert(rank as usize, ExtStat { ext: UNACCOUNTED.to_string(), size: extra, logical: 0, count: 1 });
         for node in self.nodes.iter_mut().filter(|n| !n.is_dir && n.ext >= rank) {
             node.ext += 1;
         }
@@ -214,8 +238,12 @@ impl Tree {
             logical: 0,
             ext: rank,
             children: Vec::new(),
+            files: 0,
+            folders: 0,
         });
         self.nodes[root].size += extra;
+        // Counted like a file, so `remove` would take back exactly what was added.
+        self.nodes[root].files += 1;
         self.nodes[root].children.insert(at, id);
     }
 
@@ -273,6 +301,30 @@ mod tests {
     }
 
     #[test]
+    fn finish_counts_files_and_folders_below_each_node() {
+        let mut b = TreeBuilder::new("root");
+        let root = NodeId(0);
+        let a = b.add(root, "a", true, 0, 0);
+        let sub = b.add(a, "sub", true, 0, 0);
+        b.add(sub, "x", false, 1, 1);
+        b.add(a, "y", false, 1, 1);
+        let z = b.add(root, "z", false, 1, 1);
+        let mut t = b.finish();
+
+        let counts = |t: &Tree, id: NodeId| (t.nodes[id.0 as usize].files, t.nodes[id.0 as usize].folders);
+        assert_eq!(counts(&t, root), (3, 2));
+        assert_eq!(counts(&t, a), (2, 1));
+        assert_eq!(counts(&t, sub), (1, 0));
+        assert_eq!(counts(&t, z), (0, 0));
+
+        t.remove(sub);
+        assert_eq!(counts(&t, root), (2, 1));
+        assert_eq!(counts(&t, a), (1, 0));
+        t.add_unaccounted(100);
+        assert_eq!(counts(&t, root), (3, 1));
+    }
+
+    #[test]
     fn unaccounted_space_fills_the_root_up_to_used() {
         let mut b = TreeBuilder::new("C:");
         let root = NodeId(0);
@@ -323,6 +375,7 @@ mod tests {
 
         let names: Vec<(&str, u64, u64)> = t.exts.iter().map(|e| (e.ext.as_str(), e.size, e.count)).collect();
         assert_eq!(names, vec![("rs", 100, 1), ("txt", 15, 2), ("", 1, 1)]);
+        assert_eq!(t.exts[1].logical, 15);
         let rs_node = &t.nodes[rs.0 as usize];
         assert_eq!(t.exts[rs_node.ext as usize].ext, "rs");
         let none_node = &t.nodes[none.0 as usize];
@@ -349,7 +402,7 @@ mod tests {
         assert_eq!(t.nodes[root.0 as usize].logical, 7);
         assert_eq!(t.nodes[root.0 as usize].children, vec![a, g]);
         let bin = t.exts.iter().find(|e| e.ext == "bin").unwrap();
-        assert_eq!((bin.size, bin.count), (7, 1));
+        assert_eq!((bin.size, bin.logical, bin.count), (7, 7, 1));
     }
 
     #[test]

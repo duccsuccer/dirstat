@@ -2,7 +2,7 @@
 
 use eframe::egui::{self, Color32, FontId, Mesh, Pos2, Sense, Shape, Vec2};
 use eframe::egui::text::{LayoutJob, TextWrapping};
-use crate::app::{has_shell_menu, AppState};
+use crate::app::{has_menu, AppState};
 use crate::model::{NodeId, Tree};
 use crate::treemap;
 use crate::ui_legend::color_for;
@@ -135,7 +135,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
             state.selected = Some(id);
             ensure_visible(tree, &mut state.expanded, id);
             state.scroll_to_selected = true;
-            if response.secondary_clicked() && has_shell_menu(tree, id) {
+            if response.secondary_clicked() && has_menu(tree, id) {
                 state.pending_menu = Some((id, ui.input(|i| i.modifiers.shift)));
             }
             ui.ctx().request_repaint();

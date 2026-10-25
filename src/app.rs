@@ -1,7 +1,7 @@
 //! Application state, the scan lifecycle and the top bar.
 
 use eframe::egui;
-use crate::actions;
+use crate::actions::{self, AppItem, Chosen};
 use crate::model::{NodeId, Tree};
 use crate::scan::{self, ScanEvent, ScanHandle, ScanMode, ScanTarget};
 use crate::{ui_legend, ui_tree, ui_treemap::{self, TreemapCache}};
@@ -97,18 +97,33 @@ impl AppState {
         self.treemap_cache = None;
     }
 
-    /// Shows Explorer's context menu for item `id` and, once its command has run, drops the item from the tree if
-    /// the command removed it (Delete, Shift+Delete). Errors go to `error`.
-    pub fn shell_menu(&mut self, id: NodeId, extended: bool) {
+    /// Shows the context menu for item `id`: dirstat's items, then Explorer's own unless the item has no shell menu.
+    /// Once a shell command has run, drops the item from the tree if the command removed it (Delete, Shift+Delete).
+    /// Errors go to `error`.
+    pub fn context_menu(&mut self, id: NodeId, extended: bool) {
         let Some(tree) = &self.tree else { return };
-        if !tree.is_attached(id) || !has_shell_menu(tree, id) {
+        if !tree.is_attached(id) || !has_menu(tree, id) {
             return;
         }
         let path = actions::shell_path(tree.path(id));
-        match actions::show_shell_menu(HWND(self.hwnd as *mut _), Path::new(&path), extended) {
-            Ok(true) => self.forget_if_gone(id, exists),
-            Ok(false) => {}
+        let items = [(AppItem::Explore, true)];
+        match actions::show_context_menu(HWND(self.hwnd as *mut _), Path::new(&path), extended, &items, has_shell_menu(tree, id)) {
+            Ok(Chosen::Shell) => self.forget_if_gone(id, exists),
+            Ok(Chosen::App(item)) => self.app_item(id, item),
+            Ok(Chosen::Nothing) => {}
             Err(e) => self.error = Some(format!("{path}: {}", e.message())),
+        }
+    }
+
+    /// Runs one of dirstat's own menu items on item `id`. Errors go to `error`.
+    fn app_item(&mut self, id: NodeId, item: AppItem) {
+        let Some(tree) = &self.tree else { return };
+        let path = actions::shell_path(tree.path(id));
+        let result = match item {
+            AppItem::Explore => actions::explore(Path::new(&path), !tree.nodes[id.0 as usize].is_dir),
+        };
+        if let Err(e) = result {
+            self.error = Some(format!("{path}: {e}"));
         }
     }
 
@@ -181,7 +196,7 @@ impl eframe::App for AppState {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         if let Some((id, extended)) = self.pending_menu.take() {
-            self.shell_menu(id, extended);
+            self.context_menu(id, extended);
         }
         if ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy))) {
             self.copy_selected_path();
@@ -219,6 +234,11 @@ impl eframe::App for AppState {
 /// unaccounted item get no shell menu.
 pub(crate) fn has_shell_menu(tree: &Tree, id: NodeId) -> bool {
     id != tree.root && !tree.is_unaccounted(id)
+}
+
+/// True when item `id` gets a context menu at all: every item but the unaccounted one, which is no file or folder.
+pub(crate) fn has_menu(tree: &Tree, id: NodeId) -> bool {
+    !tree.is_unaccounted(id)
 }
 
 /// False only when nothing is at `path` any more; a link counts as itself, whatever it points to.
@@ -504,6 +524,8 @@ mod tests {
         assert!(!has_shell_menu(tree, item));
         assert!(!has_shell_menu(tree, tree.root));
         assert!(has_shell_menu(tree, f));
+        assert!(!has_menu(tree, item));
+        assert!(has_menu(tree, tree.root));
         state.forget_if_gone(item, |_| panic!("the unaccounted item must not be checked"));
         assert_eq!(root_size(&state), 100);
     }

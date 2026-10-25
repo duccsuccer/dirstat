@@ -1,12 +1,15 @@
 //! File actions on one item: Explorer's own context menu for it, and copying its path.
 
 use std::ffi::c_void;
-use std::path::Path;
-use windows::core::{w, Interface, Result as WinResult, HSTRING, PCSTR};
+use std::os::windows::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use windows::core::{w, Interface, Result as WinResult, HSTRING, PCSTR, PCWSTR};
 use windows::Win32::Foundation::{FreeLibrary, ERROR_CANCELLED, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32};
 use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
+use windows::Win32::System::SystemInformation::{GetSystemDirectoryW, GetWindowsDirectoryW};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_SHIFT};
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
@@ -15,8 +18,9 @@ use windows::Win32::UI::Shell::{
     CMIC_MASK_SHIFT_DOWN, CMINVOKECOMMANDINFO,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreatePopupMenu, DestroyMenu, GetCursorPos, TrackPopupMenuEx, SW_SHOWNORMAL, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_DRAWITEM,
-    WM_INITMENUPOPUP, WM_MEASUREITEM, WM_MENUCHAR,
+    AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, GetMenuItemCount, TrackPopupMenuEx, HMENU, MF_ENABLED, MF_GRAYED,
+    MF_SEPARATOR, MF_STRING, SW_SHOWNORMAL, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_DRAWITEM, WM_INITMENUPOPUP, WM_MEASUREITEM,
+    WM_MENUCHAR,
 };
 
 /// `path` as Explorer and the clipboard need it: a drive root `C:` (which means "current folder on C:")
@@ -34,63 +38,135 @@ pub fn copy_path(path: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-/// Menu command ids the shell may use; 0 is what TrackPopupMenuEx returns when the menu is dismissed.
-const FIRST_ID: u32 = 1;
+/// Command ids: dirstat's items get 1 up to `SHELL_FIRST`, the shell's start at `SHELL_FIRST`, so they never clash.
+/// 0 is what TrackPopupMenuEx returns when the menu is dismissed.
+const APP_FIRST: u32 = 1;
+const SHELL_FIRST: u32 = 100;
 const LAST_ID: u32 = 0x7FFF;
 /// SEE_MASK_NOASYNC, which windows-rs does not name for CMINVOKECOMMANDINFO: run the verb before returning, so a
 /// Delete has finished when the tree is checked.
 const CMIC_MASK_NOASYNC: u32 = 0x100;
 const SUBCLASS_ID: usize = 1;
 
-/// Shows Explorer's context menu for `path` at the mouse pointer, owned by window `hwnd`, and runs the chosen
-/// command. `extended` adds the verbs Explorer shows when Shift is held. `Ok(false)` when the menu was dismissed;
-/// a command the user cancelled (in its own dialog) counts as run.
-pub fn show_shell_menu(hwnd: HWND, path: &Path, extended: bool) -> WinResult<bool> {
+/// dirstat's own menu items. Each one's command id is its position in `ALL` plus `APP_FIRST`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppItem {
+    Explore,
+}
+
+impl AppItem {
+    const ALL: [AppItem; 1] = [AppItem::Explore];
+
+    fn label(self) -> &'static str {
+        match self {
+            AppItem::Explore => "Explore Folder",
+        }
+    }
+
+    fn id(self) -> u32 {
+        // Declaration order, as `ALL` lists them.
+        self as u32 + APP_FIRST
+    }
+
+    fn from_id(id: u32) -> Option<AppItem> {
+        Self::ALL.get(id.checked_sub(APP_FIRST)? as usize).copied()
+    }
+}
+
+/// What the user chose in the context menu.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Chosen {
+    /// The menu was dismissed.
+    Nothing,
+    App(AppItem),
+    /// A command of the shell's part ran (a command the user cancelled in its own dialog counts as run).
+    Shell,
+}
+
+/// Shows dirstat's items `items` (each with whether it is enabled) at the mouse pointer, owned by window `hwnd`.
+/// When `shell` is set, Explorer's own items for `path` follow them after a separator; `extended` adds the verbs
+/// Explorer shows when Shift is held. A shell command that is chosen runs before this returns.
+pub fn show_context_menu(hwnd: HWND, path: &Path, extended: bool, items: &[(AppItem, bool)], shell: bool) -> WinResult<Chosen> {
     let _com = ComApartment::enter();
-    let menu = context_menu(hwnd, path)?;
+    let menu = if shell { Some(context_menu(hwnd, path)?) } else { None };
     // Read every time, so a theme switch while dirstat runs shows on the next menu.
     apply_menu_theme(menu_app_mode(apps_use_light_theme()));
     let id = unsafe {
         let popup = CreatePopupMenu()?;
-        let chosen = track(&menu, popup, hwnd, extended);
+        let chosen = track(menu.as_ref(), items, popup, hwnd, extended);
         let _ = DestroyMenu(popup);
         chosen?
     };
-    if id < FIRST_ID {
-        return Ok(false);
+    if id < SHELL_FIRST {
+        return Ok(AppItem::from_id(id).map_or(Chosen::Nothing, Chosen::App));
     }
+    let Some(menu) = menu else { return Ok(Chosen::Nothing) };
     let held = |key: u16, mask: u32| if unsafe { GetKeyState(i32::from(key)) } < 0 { mask } else { 0 };
     let info = CMINVOKECOMMANDINFO {
         cbSize: size_of::<CMINVOKECOMMANDINFO>() as u32,
         // Shift held while choosing Delete makes it a permanent delete, as in Explorer.
         fMask: CMIC_MASK_NOASYNC | held(VK_SHIFT.0, CMIC_MASK_SHIFT_DOWN) | held(VK_CONTROL.0, CMIC_MASK_CONTROL_DOWN),
         hwnd,
-        // MAKEINTRESOURCE: the command given by its offset from the first id.
-        lpVerb: PCSTR((id - FIRST_ID) as usize as *const u8),
+        // MAKEINTRESOURCE: the command given by its offset from the first shell id.
+        lpVerb: PCSTR((id - SHELL_FIRST) as usize as *const u8),
         nShow: SW_SHOWNORMAL.0,
         ..Default::default()
     };
     match unsafe { menu.InvokeCommand(&info) } {
-        Err(e) if e.code() == ERROR_CANCELLED.to_hresult() => Ok(true),
-        result => result.map(|()| true),
+        Err(e) if e.code() == ERROR_CANCELLED.to_hresult() => Ok(Chosen::Shell),
+        result => result.map(|()| Chosen::Shell),
     }
 }
 
-/// Fills `popup` with the shell's items and shows it at the mouse pointer until the user picks one (its id) or
-/// dismisses it (0).
-unsafe fn track(menu: &IContextMenu, popup: windows::Win32::UI::WindowsAndMessaging::HMENU, hwnd: HWND, extended: bool) -> WinResult<u32> {
+/// Fills `popup` with `items`, then the shell's items after a separator when `menu` is set, and shows it at the mouse
+/// pointer until the user picks one (its id) or dismisses it (0).
+unsafe fn track(menu: Option<&IContextMenu>, items: &[(AppItem, bool)], popup: HMENU, hwnd: HWND, extended: bool) -> WinResult<u32> {
     unsafe {
-        menu.QueryContextMenu(popup, 0, FIRST_ID, LAST_ID, menu_flags(extended)).ok()?;
+        for &(item, enabled) in items {
+            let state = if enabled { MF_ENABLED } else { MF_GRAYED };
+            AppendMenuW(popup, MF_STRING | state, item.id() as usize, &HSTRING::from(item.label()))?;
+        }
         let mut at = POINT::default();
+        if let Some(menu) = menu {
+            AppendMenuW(popup, MF_SEPARATOR, 0, PCWSTR::null())?;
+            menu.QueryContextMenu(popup, GetMenuItemCount(Some(popup)) as u32, SHELL_FIRST, LAST_ID, menu_flags(extended)).ok()?;
+        }
         GetCursorPos(&mut at)?;
-        // Send To and Open With fill their submenus, and handlers draw their icons, only when the owner window hands
-        // them its menu messages, so the window is subclassed while the menu is open. The menu outlives the subclass,
-        // which is removed below.
-        let _ = SetWindowSubclass(hwnd, Some(forward_menu_messages), SUBCLASS_ID, menu.as_raw() as usize);
+        if let Some(menu) = menu {
+            // Send To and Open With fill their submenus, and handlers draw their icons, only when the owner window hands
+            // them its menu messages, so the window is subclassed while the menu is open. The menu outlives the subclass,
+            // which is removed below.
+            let _ = SetWindowSubclass(hwnd, Some(forward_menu_messages), SUBCLASS_ID, menu.as_raw() as usize);
+        }
         let id = TrackPopupMenuEx(popup, (TPM_RETURNCMD | TPM_RIGHTBUTTON).0, at.x, at.y, hwnd, None).0 as u32;
         let _ = RemoveWindowSubclass(hwnd, Some(forward_menu_messages), SUBCLASS_ID);
         Ok(id)
     }
+}
+
+/// Opens Explorer on `path`, or with `path` selected in its folder when `select` is set.
+pub fn explore(path: &Path, select: bool) -> std::io::Result<()> {
+    let mut command = Command::new(system_dir(false).join("explorer.exe"));
+    if select {
+        // explorer.exe needs the quotes around the path, which Command's own argument quoting would escape.
+        command.raw_arg(format!("/select,\"{}\"", path.display()));
+    } else {
+        command.arg(path);
+    }
+    command.spawn().map(drop)
+}
+
+/// The Windows directory, or the system directory (System32) when `system` is set, as the system reports it.
+fn system_dir(system: bool) -> PathBuf {
+    let mut buf = [0u16; 512];
+    let len = unsafe {
+        if system {
+            GetSystemDirectoryW(Some(&mut buf))
+        } else {
+            GetWindowsDirectoryW(Some(&mut buf))
+        }
+    } as usize;
+    PathBuf::from(String::from_utf16_lossy(&buf[..len.min(buf.len())]))
 }
 
 /// QueryContextMenu flags: what Explorer asks for on a selected item (`extended` = Shift held). No CMF_CANRENAME:
@@ -223,6 +299,15 @@ mod tests {
         assert_eq!(shell_path("C:".into()), r"C:\");
         assert_eq!(shell_path(r"C:\Users".into()), r"C:\Users");
         assert_eq!(shell_path(r"\\server\share".into()), r"\\server\share");
+    }
+
+    #[test]
+    fn app_item_ids_stay_below_the_shell_range() {
+        for item in AppItem::ALL {
+            assert_eq!(AppItem::from_id(item.id()), Some(item));
+            assert!(item.id() < SHELL_FIRST);
+        }
+        assert_eq!(AppItem::from_id(0), None);
     }
 
     #[test]

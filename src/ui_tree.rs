@@ -1,7 +1,7 @@
 //! Directory tree pane (top-left), and the table drawing it shares with the file-type pane.
 
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Shape, Stroke, TextStyle, Vec2};
-use crate::app::{has_shell_menu, AppState};
+use crate::app::{has_menu, AppState};
 use crate::model::{NodeId, Tree};
 use crate::ui_legend::color_for;
 use std::collections::HashSet;
@@ -81,7 +81,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
                 }
                 if response.secondary_clicked() {
                     click = Some(Click::Select(id));
-                    if has_shell_menu(tree, id) {
+                    if has_menu(tree, id) {
                         menu = Some(id);
                     }
                 }

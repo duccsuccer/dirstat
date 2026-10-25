@@ -40,6 +40,10 @@ pub struct TreeBuilder {
     exts: Vec<ExtStat>,
 }
 
+/// Name (and legend entry) of the item that holds a volume's used space no scanned file accounts for: NTFS metadata
+/// such as `$MFT` and the journal, folder indexes, and whatever the scan could not read. `<` cannot start a Windows file name.
+pub const UNACCOUNTED: &str = "<metadata and unaccounted>";
+
 const NO_EXT: u16 = u16::MAX;
 /// Last usable extension id; ids below it are individual extensions, this one is the "(other)" bucket.
 const OTHER_EXT_ID: u16 = u16::MAX - 1;
@@ -185,6 +189,42 @@ impl Tree {
         }
     }
 
+    /// Adds an [`UNACCOUNTED`] item at the root for the part of `used` (the volume's used bytes) no file accounts
+    /// for, so the root equals the volume's used space. Nothing is added when the files already cover `used`.
+    pub fn add_unaccounted(&mut self, used: u64) {
+        let root = self.root.0 as usize;
+        let extra = used.saturating_sub(self.nodes[root].size);
+        // Past 65534 extensions there is no free ext id; the gap then stays unshown.
+        if extra == 0 || self.exts.len() >= OTHER_EXT_ID as usize {
+            return;
+        }
+        // Keep `exts` ranked by size as `finish` leaves them: insert at the new stat's rank, shift the ids below it.
+        let rank = self.exts.partition_point(|e| e.size >= extra) as u16;
+        self.exts.insert(rank as usize, ExtStat { ext: UNACCOUNTED.to_string(), size: extra, count: 1 });
+        for node in self.nodes.iter_mut().filter(|n| !n.is_dir && n.ext >= rank) {
+            node.ext += 1;
+        }
+        let id = NodeId(self.nodes.len() as u32);
+        let at = self.nodes[root].children.partition_point(|c| self.nodes[c.0 as usize].size >= extra);
+        self.nodes.push(Node {
+            name: UNACCOUNTED.to_string(),
+            parent: Some(self.root),
+            is_dir: false,
+            size: extra,
+            logical: 0,
+            ext: rank,
+            children: Vec::new(),
+        });
+        self.nodes[root].size += extra;
+        self.nodes[root].children.insert(at, id);
+    }
+
+    /// True for the item `add_unaccounted` made: it is no file, so it cannot be opened, copied or deleted.
+    pub fn is_unaccounted(&self, id: NodeId) -> bool {
+        let node = &self.nodes[id.0 as usize];
+        node.parent == Some(self.root) && !node.is_dir && node.name == UNACCOUNTED
+    }
+
     /// True when following parents from `id` reaches the root, i.e. `id` has not been removed.
     pub fn is_attached(&self, mut id: NodeId) -> bool {
         while let Some(parent) = self.nodes[id.0 as usize].parent {
@@ -230,6 +270,45 @@ mod tests {
             .map(|c| t.nodes[c.0 as usize].name.as_str())
             .collect();
         assert_eq!(a_children, vec!["y", "x"]);
+    }
+
+    #[test]
+    fn unaccounted_space_fills_the_root_up_to_used() {
+        let mut b = TreeBuilder::new("C:");
+        let root = NodeId(0);
+        let a = b.add(root, "a", true, 0, 0);
+        b.add(a, "big.bin", false, 100, 100);
+        b.add(root, "small.txt", false, 10, 10);
+        let mut t = b.finish();
+
+        t.add_unaccounted(160);
+
+        assert_eq!(t.nodes[root.0 as usize].size, 160);
+        assert_eq!(t.nodes[root.0 as usize].logical, 110);
+        let id = t.nodes[root.0 as usize].children[1];
+        assert!(t.is_unaccounted(id));
+        assert_eq!((t.nodes[id.0 as usize].size, t.nodes[id.0 as usize].name.as_str()), (50, UNACCOUNTED));
+        // Children and exts stay sorted by size, and every file still names its own ext.
+        let sizes: Vec<u64> = t.nodes[root.0 as usize].children.iter().map(|c| t.nodes[c.0 as usize].size).collect();
+        assert_eq!(sizes, [100, 50, 10]);
+        let exts: Vec<&str> = t.exts.iter().map(|e| e.ext.as_str()).collect();
+        assert_eq!(exts, ["bin", UNACCOUNTED, "txt"]);
+        for n in t.nodes.iter().filter(|n| !n.is_dir) {
+            let ext = &t.exts[n.ext as usize].ext;
+            assert!(n.name.ends_with(ext.as_str()), "{} has ext {ext}", n.name);
+        }
+        assert!(!t.is_unaccounted(a));
+    }
+
+    #[test]
+    fn nothing_unaccounted_when_files_cover_used_space() {
+        let mut b = TreeBuilder::new("C:");
+        b.add(NodeId(0), "f.bin", false, 100, 100);
+        let mut t = b.finish();
+        t.add_unaccounted(100);
+        t.add_unaccounted(40);
+        assert_eq!(t.nodes.len(), 2);
+        assert_eq!(t.nodes[0].size, 100);
     }
 
     #[test]

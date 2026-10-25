@@ -11,8 +11,9 @@ use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
-use windows::core::PCWSTR;
-use windows::Win32::Storage::FileSystem::GetVolumeInformationW;
+use windows::core::{HSTRING, PCWSTR};
+use windows::Win32::Storage::FileSystem::{GetDiskFreeSpaceExW, GetDriveTypeW, GetVolumeInformationW};
+use windows::Win32::System::WindowsProgramming::DRIVE_REMOTE;
 
 #[derive(Debug, Clone)]
 pub enum ScanTarget {
@@ -87,6 +88,8 @@ struct Scanners {
     walk: Box<dyn Fn(&Path, &AtomicBool, &mut dyn FnMut(u64, u64)) -> (Tree, u64) + Send>,
     fs_name: Box<dyn Fn(char) -> String + Send>,
     root_check: Box<dyn Fn(&Path) -> std::io::Result<()> + Send>,
+    /// Used bytes of a volume, for the unaccounted item of a whole-volume scan.
+    used: Box<dyn Fn(char) -> Option<u64> + Send>,
 }
 
 impl Scanners {
@@ -96,8 +99,21 @@ impl Scanners {
             walk: Box::new(walk::walk),
             fs_name: Box::new(volume_fs_name),
             root_check: Box::new(|root: &Path| std::fs::read_dir(root).map(|_| ())),
+            used: Box::new(volume_used),
         }
     }
+}
+
+/// Used bytes (size minus free space, as Explorer shows them) of volume `letter`; `None` for a network drive,
+/// whose used space belongs to the server's volume rather than to what this drive shows, or when unreadable.
+fn volume_used(letter: char) -> Option<u64> {
+    let root = HSTRING::from(format!(r"{letter}:\"));
+    if unsafe { GetDriveTypeW(&root) } == DRIVE_REMOTE {
+        return None;
+    }
+    let (mut total, mut free) = (0u64, 0u64);
+    unsafe { GetDiskFreeSpaceExW(&root, None, Some(&mut total), Some(&mut free)) }.ok()?;
+    Some(total.saturating_sub(free))
 }
 
 /// Filesystem name of volume `letter` (for example "NTFS"), or empty when it cannot be read.
@@ -152,7 +168,7 @@ fn run(target: &ScanTarget, tx: &Sender<ScanEvent>, repaint: &dyn Fn(), cancel: 
         _ => None,
     };
 
-    let (tree, mode, skipped) = match mft_result {
+    let (mut tree, mode, skipped) = match mft_result {
         Some(Ok(tree)) => (tree, ScanMode::Mft, 0),
         // A cancelled MFT scan must not fall back to the walk.
         Some(Err(_)) if cancel.load(Ordering::SeqCst) => return,
@@ -175,6 +191,11 @@ fn run(target: &ScanTarget, tx: &Sender<ScanEvent>, repaint: &dyn Fn(), cancel: 
 
     if cancel.load(Ordering::SeqCst) {
         return;
+    }
+    // Neither scanner sees NTFS metadata or folder indexes (nor the walk what it cannot read); a whole volume shows
+    // that space as one item, so its root matches the used space Windows reports.
+    if let Some(used) = letter.filter(|_| matches!(target, ScanTarget::Volume(_))).and_then(|l| (scanners.used)(l)) {
+        tree.add_unaccounted(used);
     }
     let _ = tx.send(ScanEvent::Done { tree, mode, skipped });
     repaint();
@@ -227,6 +248,7 @@ mod tests {
             }),
             fs_name: Box::new(|_| "FAT32".into()),
             root_check: Box::new(readable),
+            used: Box::new(|_| None),
         }
     }
 
@@ -246,12 +268,47 @@ mod tests {
             walk: Box::new(fake_walk),
             fs_name: Box::new(|_| "NTFS".into()),
             root_check: Box::new(readable),
+            used: Box::new(|_| None),
         };
         let _handle = start_with(ScanTarget::Volume('C'), tx, no_repaint(), scanners);
         match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
             ScanEvent::Done { mode, .. } => assert_eq!(mode, ScanMode::Walk),
             other => panic!("expected Done, got {other:?}"),
         }
+    }
+
+    /// Runs `target` with a walk returning one 1000-byte file on a volume whose used space is 5000 bytes.
+    fn done_tree(target: ScanTarget) -> Tree {
+        let (tx, rx) = channel();
+        let scanners = Scanners {
+            mft: Box::new(failing_mft),
+            walk: Box::new(|_: &Path, _: &AtomicBool, _: &mut dyn FnMut(u64, u64)| {
+                let mut b = TreeBuilder::new("C:");
+                b.add(crate::model::NodeId(0), "f.bin", false, 1000, 1000);
+                (b.finish(), 0)
+            }),
+            fs_name: Box::new(|_| "NTFS".into()),
+            root_check: Box::new(readable),
+            used: Box::new(|_| Some(5000)),
+        };
+        let _handle = start_with(target, tx, no_repaint(), scanners);
+        match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+            ScanEvent::Done { tree, .. } => tree,
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn volume_scan_root_equals_used_space() {
+        let t = done_tree(ScanTarget::Volume('C'));
+        assert_eq!(t.nodes[t.root.0 as usize].size, 5000);
+        assert!(t.nodes[t.root.0 as usize].children.iter().any(|&c| t.is_unaccounted(c)));
+    }
+
+    #[test]
+    fn folder_scan_has_no_unaccounted_item() {
+        let t = done_tree(ScanTarget::Folder(r"C:\data".into()));
+        assert_eq!(t.nodes[t.root.0 as usize].size, 1000);
     }
 
     #[test]
@@ -286,6 +343,7 @@ mod tests {
             }),
             fs_name: Box::new(|_| "NTFS".into()),
             root_check: Box::new(readable),
+            used: Box::new(|_| None),
         };
         let _handle = start_with(ScanTarget::Volume('C'), tx, no_repaint(), scanners);
         assert!(matches!(rx.recv_timeout(Duration::from_secs(5)), Err(RecvTimeoutError::Disconnected)));
@@ -300,6 +358,7 @@ mod tests {
             walk: Box::new(fake_walk),
             fs_name: Box::new(|_| "FAT32".into()),
             root_check: Box::new(|_: &Path| Err(std::io::Error::from(std::io::ErrorKind::NotFound))),
+            used: Box::new(|_| None),
         };
         let _handle = start_with(ScanTarget::Volume('Z'), tx, no_repaint(), scanners);
         match rx.recv_timeout(Duration::from_secs(5)).unwrap() {

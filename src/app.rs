@@ -86,7 +86,7 @@ impl AppState {
     pub(crate) fn delete_selected_with(&mut self, confirmed: bool, recycle: impl FnOnce(&Path, u64) -> DeleteOutcome) {
         let (Some(tree), Some(id)) = (self.tree.as_mut(), self.selected) else { return };
         // A detached node's path would be relative (just its name), so it must never reach `recycle`.
-        if !confirmed || id == tree.root || !tree.is_attached(id) {
+        if !confirmed || id == tree.root || !tree.is_attached(id) || tree.is_unaccounted(id) {
             return;
         }
         // The larger of the two sizes, so the bin-limit check can only err towards refusing.
@@ -407,6 +407,18 @@ mod tests {
         state.selected = Some(f);
         state.delete_selected_with(true, |_, _| panic!("recycle must not be called"));
         assert_eq!(root_size(&state), 7);
+    }
+
+    #[test]
+    fn unaccounted_item_is_never_deleted() {
+        let (mut state, _, _) = state_with_file();
+        let tree = state.tree.as_mut().unwrap();
+        tree.add_unaccounted(100);
+        let item = tree.nodes[tree.root.0 as usize].children[0];
+        assert!(tree.is_unaccounted(item));
+        state.selected = Some(item);
+        state.delete_selected_with(true, |_, _| panic!("recycle must not be called"));
+        assert_eq!(root_size(&state), 100);
     }
 
     #[test]

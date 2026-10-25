@@ -89,7 +89,11 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
         }
     }
     // The menu acts on the selection, which a right-click on a block has just set.
-    let menu = state.selected.and_then(|id| item_menu(&response, id != tree.root).map(|action| (id, action)));
+    // The unaccounted item is no file: nothing to open, copy or delete.
+    let menu = state
+        .selected
+        .filter(|&id| !tree.is_unaccounted(id))
+        .and_then(|id| item_menu(&response, id != tree.root).map(|action| (id, action)));
     if let Some(id) = response.hover_pos().and_then(hit) {
         let node = &tree.nodes[id.0 as usize];
         response.on_hover_ui_at_pointer(|ui| {

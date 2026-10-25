@@ -72,8 +72,11 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
                 if response.secondary_clicked() {
                     click = Some(Click::Select(id));
                 }
-                if let Some(action) = item_menu(&response, id != tree.root) {
-                    menu = Some((id, action));
+                // The unaccounted item is no file: nothing to open, copy or delete.
+                if !tree.is_unaccounted(id) {
+                    if let Some(action) = item_menu(&response, id != tree.root) {
+                        menu = Some((id, action));
+                    }
                 }
             }
         });

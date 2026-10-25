@@ -249,7 +249,7 @@ impl eframe::App for AppState {
         let top = egui::Panel::top("top_bar").frame(panel_frame(ui, egui::Margin::symmetric(32, 24))).show(ui, |ui| top_bar(ui, self)).response.rect;
         ui.painter().hline(top.x_range(), top.bottom() - 0.5, line);
         let status = egui::Panel::bottom("status")
-            .frame(panel_frame(ui, egui::Margin::symmetric(32, 24)))
+            .frame(panel_frame(ui, egui::Margin::symmetric(16, 3)))
             .show(ui, |ui| {
                 if let Some(tree) = &self.tree {
                     let text = selection_status(tree, status_node(tree, self.selected, self.treemap_root));
@@ -259,9 +259,10 @@ impl eframe::App for AppState {
             .response
             .rect;
         ui.painter().hline(status.x_range(), status.top() + 0.5, line);
-        let treemap_height = ui.ctx().content_rect().height() * 0.4;
+        // The treemap takes a share of the height left between the top bar and the status line.
+        let treemap_height = ui.available_rect_before_wrap().height() * 0.38;
         let treemap = egui::Panel::bottom("treemap")
-            .frame(panel_frame(ui, egui::Margin::symmetric(32, 24)))
+            .frame(panel_frame(ui, egui::Margin::symmetric(8, 0)))
             .resizable(true)
             .default_size(treemap_height)
             .show(ui, |ui| ui_treemap::show(ui, self))

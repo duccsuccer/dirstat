@@ -20,6 +20,8 @@ const LABEL_PAD: f32 = 3.0;
 const LABEL_MIN_W: f32 = 10.0;
 /// Height of the name strip at the top of a large folder, in points.
 const HEADER_H: f32 = 14.0;
+/// Height of the strip above the treemap that names the shown folder.
+const TITLE_H: f32 = 22.0;
 
 /// Layout of the pane at one size. The layout is in physical pixels, so every edge and border line lands on a
 /// whole pixel; both meshes are in absolute screen points, placed at `origin`. `highlight` outlines the selection
@@ -85,7 +87,14 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
     };
     let root = state.treemap_root;
     let dark = ui.visuals().dark_mode;
-    ui.vertical_centered(|ui| ui.strong(shell_path(tree.path(root))));
+    // The path of the shown folder, centred in a thin strip above the blocks.
+    let strip = ui
+        .allocate_ui_with_layout(Vec2::new(ui.available_width(), TITLE_H), egui::Layout::top_down(egui::Align::Center), |ui| {
+            ui.strong(shell_path(tree.path(root)))
+        })
+        .response
+        .rect;
+    ui.painter().hline(strip.x_range(), strip.bottom() - 0.5, egui::Stroke::new(1.0, palette(dark).separator));
     let size = ui.available_size();
     let (response, painter) = ui.allocate_painter(size, Sense::click());
     let origin = response.rect.min;

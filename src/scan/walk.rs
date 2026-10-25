@@ -26,7 +26,7 @@ const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
 /// Scans `root` with a parallel directory walk. Calls `on_progress` with running file and allocated-byte totals.
 /// Returns the tree and the number of entries that could not be read.
 pub fn walk(root: &Path, cancel: &AtomicBool, on_progress: &mut dyn FnMut(u64, u64)) -> (Tree, u64) {
-    let name = root.to_string_lossy().trim_end_matches('\\').to_string();
+    let name = root_name(root);
     let scan_root = verbatim(root);
     let (tx, rx) = mpsc::channel();
 
@@ -50,11 +50,32 @@ pub fn walk(root: &Path, cancel: &AtomicBool, on_progress: &mut dyn FnMut(u64, u
     (builder.finish(), skipped)
 }
 
+/// The root as given, without a trailing `\` or a `\\?\` prefix (so both scan modes name it alike);
+/// `\\?\UNC\server\share` becomes `\\server\share`.
+fn root_name(root: &Path) -> String {
+    let name = root.to_string_lossy();
+    let name = match name.strip_prefix(r"\\?\UNC\") {
+        Some(rest) => format!(r"\\{rest}"),
+        None => name.strip_prefix(r"\\?\").unwrap_or(&name).to_string(),
+    };
+    name.trim_end_matches('\\').to_string()
+}
+
 /// Long-path form of the absolute path, so paths past MAX_PATH resolve.
 fn verbatim(root: &Path) -> PathBuf {
     let absolute = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
+    let text = absolute.as_os_str().to_string_lossy();
+    if text.starts_with(r"\\?\") {
+        return absolute;
+    }
     let mut path = OsString::from(r"\\?\");
-    path.push(absolute.as_os_str());
+    match text.strip_prefix(r"\\") {
+        Some(unc) => {
+            path.push(r"UNC\");
+            path.push(unc);
+        }
+        None => path.push(absolute.as_os_str()),
+    }
     PathBuf::from(path)
 }
 
@@ -383,6 +404,24 @@ mod tests {
         assert_eq!(skipped, 0);
         assert_eq!(count_named(&tree, "deep.txt"), 1);
         assert_eq!(count_named(&tree, "\u{10348}.txt"), 1);
+    }
+
+    #[test]
+    fn verbatim_handles_drive_unc_and_verbatim_paths() {
+        let v = |p: &str| verbatim(Path::new(p)).to_string_lossy().into_owned();
+        assert_eq!(v(r"C:\x\y"), r"\\?\C:\x\y");
+        assert_eq!(v(r"\\server\share\dir"), r"\\?\UNC\server\share\dir");
+        assert_eq!(v(r"\\?\C:\x"), r"\\?\C:\x");
+        assert_eq!(v(r"\\?\UNC\server\share"), r"\\?\UNC\server\share");
+    }
+
+    #[test]
+    fn root_name_drops_verbatim_prefix() {
+        let n = |p: &str| root_name(Path::new(p));
+        assert_eq!(n(r"C:\x\"), r"C:\x");
+        assert_eq!(n(r"\\?\C:\x"), r"C:\x");
+        assert_eq!(n(r"\\server\share"), r"\\server\share");
+        assert_eq!(n(r"\\?\UNC\server\share\"), r"\\server\share");
     }
 
     #[test]

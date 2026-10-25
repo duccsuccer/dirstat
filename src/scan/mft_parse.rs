@@ -157,7 +157,8 @@ fn data_sizes(attr: &[u8], non_resident: bool) -> Option<(u64, u64)> {
     if non_resident {
         // @0x28 is the virtual size rounded up; compressed or sparse streams (attribute flags 0x0001 | 0x8000, as
         // ntfs-3g and TSK decide; sparse files may have compression unit 0) report the stored size at @0x40.
-        let stored = u16_at(attr, 0x0C)? & (0x0001 | 0x8000) != 0;
+        // The stored size exists only if the header reaches 0x48; otherwise @0x40 is run-list bytes.
+        let stored = u16_at(attr, 0x0C)? & (0x0001 | 0x8000) != 0 && u16_at(attr, 0x20)? >= 0x48;
         let allocated = if stored && attr.len() >= 0x48 {
             u64_at(attr, 0x40)?
         } else {
@@ -389,6 +390,17 @@ mod tests {
         data.truncate(0x40);
         put(&mut data, 4, &0x40u32.to_le_bytes());
         let mut rec = make_record(FLAG_IN_USE, &[(5, NS_WIN32, "short.bin")], &[data]);
+        assert_eq!(parse_record(&mut rec, 1).expect("record should parse").allocated, 8192);
+    }
+
+    #[test]
+    fn flagged_data_with_short_header_ignores_run_list_bytes() {
+        let mut data = nonresident_attr(TYPE_DATA, 0x8000, 8192, 5000);
+        data.truncate(0x40);
+        data.extend_from_slice(&[0xFF; 16]); // run list starts at 0x40
+        put(&mut data, 4, &0x50u32.to_le_bytes());
+        put(&mut data, 0x20, &0x40u16.to_le_bytes());
+        let mut rec = make_record(FLAG_IN_USE, &[(5, NS_WIN32, "hdr.bin")], &[data]);
         assert_eq!(parse_record(&mut rec, 1).expect("record should parse").allocated, 8192);
     }
 

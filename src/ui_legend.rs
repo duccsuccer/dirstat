@@ -4,17 +4,14 @@ use eframe::egui::{self, Align2, Rect, Sense, Vec2};
 use crate::app::AppState;
 use crate::model::UNACCOUNTED;
 use crate::theme::swatch;
-use crate::ui_tree::{cells, format_count, format_size, header, placeholder, row_background, row_height, share_bar, text};
+use crate::ui_tree::{cells, format_size, header, placeholder, row_background, row_height, text};
 use windows::core::HSTRING;
 use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
 use windows::Win32::UI::Shell::{SHGetFileInfoW, SHFILEINFOW, SHGFI_TYPENAME, SHGFI_USEFILEATTRIBUTES};
 
 /// Title and width of each column; the file type takes the width the others leave.
-const COLUMNS: [(&str, f32); 7] =
-    [("", 20.0), ("Extension", 76.0), ("File Type", 0.0), ("Percent", 76.0), ("Size", 76.0), ("Allocated", 76.0), ("Files", 70.0)];
+const COLUMNS: [(&str, f32); 4] = [("", 20.0), ("Extension", 90.0), ("File Type", 0.0), ("Size", 90.0)];
 const FLEX: usize = 2;
-/// The extensions are ordered by size on disk, the Allocated column.
-const SORTED: usize = 5;
 
 pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
     let Some(tree) = state.tree.as_ref() else {
@@ -22,12 +19,11 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
         return;
     };
     let type_names = &mut state.type_names;
-    let total = tree.nodes[tree.root.0 as usize].size;
     let row_h = row_height(ui);
     let widths = COLUMNS.map(|(_, w)| w);
-
     let dark = ui.visuals().dark_mode;
-    header(ui, row_h, &COLUMNS, FLEX, SORTED);
+
+    header(ui, row_h, &COLUMNS, FLEX);
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show_rows(ui, row_h, tree.exts.len(), |ui, range| {
@@ -38,18 +34,14 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
                 let color = ui.visuals().text_color();
                 let painter = ui.painter();
 
-                row_background(ui, rect, &cells, rank, false);
-                let swatch_rect = Rect::from_center_size(cells[0].center(), Vec2::splat(12.0));
+                row_background(ui, rect, false);
+                let swatch_rect = Rect::from_center_size(cells[0].center(), Vec2::splat(9.0));
                 painter.with_clip_rect(cells[0]).rect_filled(swatch_rect, 0.0, swatch(dark, rank as u16));
                 let (name, kind) = ext_columns(&ext.ext);
                 let kind = kind.unwrap_or_else(|| type_names.entry(ext.ext.clone()).or_insert_with(|| shell_type_name(&ext.ext)).clone());
                 text(painter, cells[1], &name, Align2::LEFT_CENTER, color);
                 text(painter, cells[2], &kind, Align2::LEFT_CENTER, color);
-                let share = if total == 0 { 0.0 } else { ext.size as f64 * 100.0 / total as f64 };
-                share_bar(ui, painter, cells[3], share as f32);
-                text(painter, cells[4], &format_size(ext.logical), Align2::RIGHT_CENTER, color);
-                text(painter, cells[5], &format_size(ext.size), Align2::RIGHT_CENTER, color);
-                text(painter, cells[6], &format_count(ext.count), Align2::RIGHT_CENTER, color);
+                text(painter, cells[3], &format_size(ext.size), Align2::RIGHT_CENTER, color);
             }
         });
 }

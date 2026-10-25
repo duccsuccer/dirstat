@@ -11,10 +11,7 @@ const ARROW_W: f32 = 16.0;
 const ICON_W: f32 = 16.0;
 const CELL_PAD: f32 = 4.0;
 /// Title and width of each column; the first takes the width the others leave.
-const COLUMNS: [(&str, f32); 7] =
-    [("Folder", 0.0), ("% of Parent", 100.0), ("Size", 80.0), ("Allocated", 80.0), ("Items", 80.0), ("Files", 80.0), ("Folders", 70.0)];
-/// The tree is ordered by size on disk, the Allocated column.
-const SORTED: usize = 3;
+const COLUMNS: [(&str, f32); 5] = [("Folder", 0.0), ("Share", 100.0), ("Size", 80.0), ("Allocated", 80.0), ("Files", 80.0)];
 
 enum Click {
     Select(NodeId),
@@ -35,7 +32,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
     let mut click = None;
     let mut menu = None;
 
-    header(ui, row_h, &COLUMNS, 0, SORTED);
+    header(ui, row_h, &COLUMNS, 0);
     let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]);
     if state.scroll_to_selected {
         state.scroll_to_selected = false;
@@ -44,7 +41,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
         }
     }
     scroll.show_rows(ui, row_h, rows.len(), |ui, range| {
-            for (index, &(id, depth)) in rows.iter().enumerate().skip(range.start).take(range.len()) {
+            for &(id, depth) in rows.iter().skip(range.start).take(range.len()) {
                 let node = &tree.nodes[id.0 as usize];
                 let expandable = node.is_dir && !node.children.is_empty();
                 let (rect, response) = ui.allocate_exact_size(Vec2::new(ui.available_width(), row_h), Sense::click());
@@ -56,7 +53,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
                 let color = ui.visuals().text_color();
                 let painter = ui.painter();
 
-                row_background(ui, rect, &cells, index, selected == Some(id));
+                row_background(ui, rect, selected == Some(id));
                 if expandable {
                     arrow(painter, arrow_rect.center(), expanded.contains(&id), color);
                 }
@@ -69,10 +66,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
                 text(painter, cells[2], &format_size(node.logical), Align2::RIGHT_CENTER, color);
                 text(painter, cells[3], &format_size(node.size), Align2::RIGHT_CENTER, color);
                 if node.is_dir {
-                    let (files, folders) = (u64::from(node.files), u64::from(node.folders));
-                    text(painter, cells[4], &format_count(files + folders), Align2::RIGHT_CENTER, color);
-                    text(painter, cells[5], &format_count(files), Align2::RIGHT_CENTER, color);
-                    text(painter, cells[6], &format_count(folders), Align2::RIGHT_CENTER, color);
+                    text(painter, cells[4], &format_count(u64::from(node.files)), Align2::RIGHT_CENTER, color);
                 }
 
                 if response.clicked() {
@@ -171,7 +165,7 @@ pub fn format_count(n: u64) -> String {
 pub(crate) fn row_height(ui: &mut egui::Ui) -> f32 {
     // Rows sit edge to edge so the striping has no gaps.
     ui.spacing_mut().item_spacing.y = 0.0;
-    ui.text_style_height(&TextStyle::Body) + 4.0
+    ui.text_style_height(&TextStyle::Body) + 10.0
 }
 
 /// Splits `row` into one cell per width; column `flex` takes whatever the other widths leave.
@@ -190,39 +184,27 @@ pub(crate) fn cells(row: Rect, widths: &[f32], flex: usize) -> Vec<Rect> {
         .collect()
 }
 
-/// Column titles with grid lines; column `sorted` gets a down arrow, as the rows are ordered by it.
-pub(crate) fn header(ui: &mut egui::Ui, row_h: f32, columns: &[(&str, f32)], flex: usize, sorted: usize) {
+/// Small muted column titles over a hairline. Columns after `flex` are right-aligned, as their numbers are.
+pub(crate) fn header(ui: &mut egui::Ui, row_h: f32, columns: &[(&str, f32)], flex: usize) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), row_h), Sense::hover());
     let widths: Vec<f32> = columns.iter().map(|&(_, w)| w).collect();
-    let cells = cells(rect, &widths, flex);
-    let color = palette(ui.visuals().dark_mode).header;
+    let pal = palette(ui.visuals().dark_mode);
     let painter = ui.painter();
-    painter.rect_filled(rect, 0.0, ui.visuals().faint_bg_color);
-    for (i, (cell, (title, _))) in cells.iter().zip(columns).enumerate() {
-        text(painter, *cell, title, Align2::LEFT_CENTER, color);
-        if i == sorted {
-            arrow(painter, Pos2::new(cell.right() - 10.0, cell.center().y), true, color);
-        }
-        grid_line(ui, painter, *cell);
+    for (i, (cell, (title, _))) in cells(rect, &widths, flex).iter().zip(columns).enumerate() {
+        let (x, align) = if i > flex { (cell.right() - CELL_PAD, Align2::RIGHT_CENTER) } else { (cell.left() + CELL_PAD, Align2::LEFT_CENTER) };
+        painter.with_clip_rect(*cell).text(Pos2::new(x, cell.center().y), align, title, FontId::proportional(11.0), pal.header);
     }
+    painter.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, pal.rule));
 }
 
-/// Selection highlight or the stripe of every other row, then the column grid lines.
-pub(crate) fn row_background(ui: &egui::Ui, row: Rect, cells: &[Rect], index: usize, selected: bool) {
+/// The selected row's fill, then the hairline under every row.
+pub(crate) fn row_background(ui: &egui::Ui, row: Rect, selected: bool) {
+    let pal = palette(ui.visuals().dark_mode);
     let painter = ui.painter();
     if selected {
-        painter.rect_filled(row, 0.0, palette(ui.visuals().dark_mode).selected);
-    } else if index % 2 == 1 {
-        painter.rect_filled(row, 0.0, ui.visuals().faint_bg_color);
+        painter.rect_filled(row, 0.0, pal.selected);
     }
-    for cell in cells {
-        grid_line(ui, painter, *cell);
-    }
-}
-
-fn grid_line(ui: &egui::Ui, painter: &egui::Painter, cell: Rect) {
-    let stroke = Stroke::new(1.0, palette(ui.visuals().dark_mode).rule);
-    painter.vline(cell.right() - 0.5, cell.y_range(), stroke);
+    painter.hline(row.x_range(), row.bottom() - 0.5, Stroke::new(1.0, pal.rule));
 }
 
 /// `s` in `cell`, clipped to it, against its left or right edge.
@@ -231,14 +213,16 @@ pub(crate) fn text(painter: &egui::Painter, cell: Rect, s: &str, align: Align2, 
     painter.with_clip_rect(cell).text(Pos2::new(x, cell.center().y), align, s, FontId::default(), color);
 }
 
-/// A bar filled to `percent` of the cell, with the number over it.
+/// A 3px line across the cell, filled to `percent` in the accent colour.
 pub(crate) fn share_bar(ui: &egui::Ui, painter: &egui::Painter, cell: Rect, percent: f32) {
-    let bar = cell.shrink2(Vec2::new(CELL_PAD, 2.0));
     let pal = palette(ui.visuals().dark_mode);
-    painter.rect_filled(bar, 0.0, pal.rule);
+    let track = Rect::from_min_size(
+        Pos2::new(cell.left() + CELL_PAD, cell.center().y - 1.5),
+        Vec2::new((cell.width() - 2.0 * CELL_PAD).max(0.0), 3.0),
+    );
+    painter.rect_filled(track, 0.0, pal.rule);
     let filled = (percent / 100.0).clamp(0.0, 1.0);
-    painter.rect_filled(Rect::from_min_size(bar.min, Vec2::new(bar.width() * filled, bar.height())), 0.0, pal.accent);
-    text(painter, cell, &format!("{percent:.1} %"), Align2::RIGHT_CENTER, ui.visuals().text_color());
+    painter.rect_filled(Rect::from_min_size(track.min, Vec2::new(track.width() * filled, 3.0)), 0.0, pal.accent);
 }
 
 /// Expander triangle: pointing right when collapsed, down when open.

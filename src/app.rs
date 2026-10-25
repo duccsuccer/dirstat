@@ -106,7 +106,7 @@ impl AppState {
             return;
         }
         let path = actions::shell_path(tree.path(id));
-        let items = [(AppItem::Explore, true)];
+        let items = [(AppItem::Explore, true), (AppItem::CommandPrompt, true)];
         match actions::show_context_menu(HWND(self.hwnd as *mut _), Path::new(&path), extended, &items, has_shell_menu(tree, id)) {
             Ok(Chosen::Shell) => self.forget_if_gone(id, exists),
             Ok(Chosen::App(item)) => self.app_item(id, item),
@@ -119,11 +119,13 @@ impl AppState {
     fn app_item(&mut self, id: NodeId, item: AppItem) {
         let Some(tree) = &self.tree else { return };
         let path = actions::shell_path(tree.path(id));
+        let dir = actions::shell_path(tree.path(folder_of(tree, id)));
         let result = match item {
-            AppItem::Explore => actions::explore(Path::new(&path), !tree.nodes[id.0 as usize].is_dir),
+            AppItem::Explore => actions::explore(Path::new(&path), !tree.nodes[id.0 as usize].is_dir).map_err(|e| format!("{path}: {e}")),
+            AppItem::CommandPrompt => actions::command_prompt(Path::new(&dir)).map_err(|e| format!("{dir}: {e}")),
         };
         if let Err(e) = result {
-            self.error = Some(format!("{path}: {e}"));
+            self.error = Some(e);
         }
     }
 
@@ -239,6 +241,16 @@ pub(crate) fn has_shell_menu(tree: &Tree, id: NodeId) -> bool {
 /// True when item `id` gets a context menu at all: every item but the unaccounted one, which is no file or folder.
 pub(crate) fn has_menu(tree: &Tree, id: NodeId) -> bool {
     !tree.is_unaccounted(id)
+}
+
+/// The folder item `id` belongs to: itself when it is a folder, else its parent.
+pub(crate) fn folder_of(tree: &Tree, id: NodeId) -> NodeId {
+    let node = &tree.nodes[id.0 as usize];
+    if node.is_dir {
+        id
+    } else {
+        node.parent.unwrap_or(id)
+    }
 }
 
 /// False only when nothing is at `path` any more; a link counts as itself, whatever it points to.
@@ -538,6 +550,15 @@ mod tests {
         tx.send(ScanEvent::Done { tree: tree(), mode: ScanMode::Walk, skipped: 0 }).unwrap();
         state.pump();
         assert!(state.pending_menu.is_none());
+    }
+
+    #[test]
+    fn folder_of_is_the_item_or_its_parent() {
+        let (state, a, f) = state_with_file();
+        let tree = state.tree.as_ref().unwrap();
+        assert_eq!(folder_of(tree, a), a);
+        assert_eq!(folder_of(tree, f), a);
+        assert_eq!(folder_of(tree, tree.root), tree.root);
     }
 
     #[test]

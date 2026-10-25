@@ -52,14 +52,16 @@ const SUBCLASS_ID: usize = 1;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AppItem {
     Explore,
+    CommandPrompt,
 }
 
 impl AppItem {
-    const ALL: [AppItem; 1] = [AppItem::Explore];
+    const ALL: [AppItem; 2] = [AppItem::Explore, AppItem::CommandPrompt];
 
     fn label(self) -> &'static str {
         match self {
             AppItem::Explore => "Explore Folder",
+            AppItem::CommandPrompt => "Command Prompt Here",
         }
     }
 
@@ -154,6 +156,12 @@ pub fn explore(path: &Path, select: bool) -> std::io::Result<()> {
         command.arg(path);
     }
     command.spawn().map(drop)
+}
+
+/// Starts cmd.exe with `dir` as its folder, in a new console window (dirstat itself has none).
+pub fn command_prompt(dir: &Path) -> std::io::Result<()> {
+    const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+    Command::new(system_dir(true).join("cmd.exe")).current_dir(dir).creation_flags(CREATE_NEW_CONSOLE).spawn().map(drop)
 }
 
 /// The Windows directory, or the system directory (System32) when `system` is set, as the system reports it.

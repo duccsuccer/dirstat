@@ -1,5 +1,6 @@
 //! Disk scan: scan targets, the events sent to the UI, and the scanner backends.
 
+pub mod mft;
 pub mod mft_parse;
 pub mod walk;
 

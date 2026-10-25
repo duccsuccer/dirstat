@@ -2,7 +2,7 @@
 
 dirstat is an open-source disk usage analyzer for Windows in the style of WinDirStat: pick a drive or folder, see which folders and file types use the space, and open, copy or delete items. It is written in Rust with an egui interface.
 
-The scan is the point of the project. On an NTFS volume it reads the Master File Table directly instead of walking every directory. Other filesystems, and folder scans, use a parallel directory walk.
+The scan is the point of the project. On an NTFS drive it reads the Master File Table directly instead of walking every directory, both for the whole drive and for a folder on it. Other filesystems and network paths (`\\server\share`) use a parallel directory walk, as does any scan whose MFT cannot be read (for example without administrator rights).
 
 ## Build and run
 
@@ -49,6 +49,10 @@ Walk rows were measured unelevated on one machine, with the file-cache state not
 
 - Stage 1 only: scan, tree and treemap views, open, copy path, and delete to the Recycle Bin. Permanent delete and other stage 2 features are not built.
 - Windows and NTFS only for the fast path. Other filesystems (FAT32, exFAT, network shares) use the slower walk.
+- Items the walk cannot read (no permission, locked) are left out of the totals; the top bar says how many.
+- The walk recurses once per folder level, so an extremely deep folder chain could exhaust a thread stack. The MFT scan has no such limit.
+- The MFT scan reads the volume as it is on disk without flushing it first, so changes made seconds before a scan may not show.
+- Hard links are counted once. In an MFT folder scan a file is placed under its first link inside the folder.
 - The MFT scan and the delete-refusal cases have **not yet been verified on a real volume**.
 - Large, heavily fragmented files whose data lives in `$ATTRIBUTE_LIST` extension records: the MFT scan takes their sizes from the `$DATA` extent that starts at VCN 0 (the only one that records the stream sizes), wherever it lives, and takes a missing `$FILE_NAME` from an extension record. Only the first name found in extension records is used (further hard links held there are ignored), and a `$REPARSE_POINT` held only in an extension record is not seen.
 - The sizes of WOF-compressed files (`compact /exe`, used by Windows for system files) in MFT mode are unverified; the elevated test compares them with the walk.

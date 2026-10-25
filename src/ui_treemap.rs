@@ -13,6 +13,8 @@ use std::sync::Arc;
 /// Above this many selected blocks the outline is one bounding box, so a huge selection costs no more than a small one.
 const HIGHLIGHT_LIMIT: usize = 2000;
 const OUTLINE_W: f32 = 2.0;
+/// Pixels between neighbouring blocks, left unpainted so the background shows through.
+const GAP: f32 = 2.0;
 /// Space left and right of a folder label, and the narrowest label worth drawing, in points.
 const LABEL_PAD: f32 = 3.0;
 const LABEL_MIN_W: f32 = 10.0;
@@ -42,16 +44,16 @@ impl TreemapCache {
         let p = palette(dark);
         let bounds = treemap::Rect { x: 0.0, y: 0.0, w: size.0.floor(), h: size.1.floor() };
         let (blocks, dirs) = treemap::layout_with_headers(tree, root, bounds, header_px(ppp));
-        // Paint order: the border colour under everything, then folders (parents first), then files. Each rect leaves
-        // its right and bottom pixel unpainted, which shows as a 1px line between neighbours. Labels and the
-        // selection outline are drawn over this mesh.
+        // Paint order: the background colour under everything, then folders (parents first), then files. Each rect
+        // leaves its right and bottom GAP pixels unpainted, so the background shows as a gap between neighbours.
+        // Labels and the selection outline are drawn over this mesh.
         let mut mesh = Mesh::default();
         mesh.add_colored_rect(to_egui(&bounds, Pos2::ZERO, ppp), p.bg);
         for (_, d) in &dirs {
             mesh.add_colored_rect(to_egui(&inner(d), Pos2::ZERO, ppp), p.neutral);
         }
         for (id, b) in &blocks {
-            add_shaded_rect(&mut mesh, to_egui(&inner(b), Pos2::ZERO, ppp), swatch(dark, tree.nodes[id.0 as usize].ext));
+            mesh.add_colored_rect(to_egui(&inner(b), Pos2::ZERO, ppp), swatch(dark, tree.nodes[id.0 as usize].ext));
         }
         Self {
             size,
@@ -178,9 +180,9 @@ fn header_px(ppp: f32) -> f32 {
     (HEADER_H * ppp).round()
 }
 
-/// `r` less its right and bottom pixel, which are left for the border line.
+/// `r` less its right and bottom `GAP` pixels, which show the background as the gap between neighbours.
 fn inner(r: &treemap::Rect) -> treemap::Rect {
-    treemap::Rect { w: r.w - 1.0, h: r.h - 1.0, ..*r }
+    treemap::Rect { w: r.w - GAP, h: r.h - GAP, ..*r }
 }
 
 /// A rect in pixels as screen points for a pane at `origin`.
@@ -192,21 +194,6 @@ fn to_egui(r: &treemap::Rect, origin: Pos2, ppp: f32) -> egui::Rect {
 /// on whole pixels; the half pixel moves to that pixel's centre, which is what decides the rect it is painted in.
 fn to_pixels(pos: Pos2, origin: Pos2, ppp: f32) -> (f32, f32) {
     ((pos.x - origin.x) * ppp + 0.5, (pos.y - origin.y) * ppp + 0.5)
-}
-
-/// A block shaded like a cushion: lighter at the top left, darker at the bottom right.
-fn add_shaded_rect(mesh: &mut Mesh, r: egui::Rect, color: Color32) {
-    let scale = |f: f32| {
-        let c = |v: u8| (v as f32 * f).min(255.0) as u8;
-        Color32::from_rgb(c(color.r()), c(color.g()), c(color.b()))
-    };
-    let i = mesh.vertices.len() as u32;
-    mesh.colored_vertex(r.left_top(), scale(1.3));
-    mesh.colored_vertex(r.right_top(), color);
-    mesh.colored_vertex(r.left_bottom(), color);
-    mesh.colored_vertex(r.right_bottom(), scale(0.55));
-    mesh.add_triangle(i, i + 1, i + 2);
-    mesh.add_triangle(i + 1, i + 3, i + 2);
 }
 
 /// Four thin edges per rect (in pixels) in `color`, in absolute screen points for a pane at `origin`.

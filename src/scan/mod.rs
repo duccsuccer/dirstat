@@ -79,6 +79,7 @@ struct Scanners {
     mft: Box<dyn Fn(char, Option<&Path>, &AtomicBool, &mut dyn FnMut(u64, u64)) -> Result<Tree, String> + Send>,
     walk: Box<dyn Fn(&Path, &AtomicBool, &mut dyn FnMut(u64, u64)) -> (Tree, u64) + Send>,
     fs_name: Box<dyn Fn(char) -> String + Send>,
+    root_check: Box<dyn Fn(&Path) -> std::io::Result<()> + Send>,
 }
 
 impl Scanners {
@@ -87,6 +88,7 @@ impl Scanners {
             mft: Box::new(mft::scan_volume),
             walk: Box::new(walk::walk),
             fs_name: Box::new(volume_fs_name),
+            root_check: Box::new(|root: &Path| std::fs::read_dir(root).map(|_| ())),
         }
     }
 }
@@ -152,6 +154,13 @@ fn run(target: &ScanTarget, tx: &Sender<ScanEvent>, repaint: &dyn Fn(), cancel: 
                 ScanTarget::Volume(letter) => PathBuf::from(format!(r"{letter}:\")),
                 ScanTarget::Folder(path) => path.clone(),
             };
+            if let Err(err) = (scanners.root_check)(&root) {
+                if !cancel.load(Ordering::SeqCst) {
+                    let _ = tx.send(ScanEvent::Failed(format!("cannot read {}: {err}", root.display())));
+                    repaint();
+                }
+                return;
+            }
             let (tree, skipped) = (scanners.walk)(&root, cancel, &mut on_progress);
             (tree, ScanMode::Walk, skipped)
         }
@@ -189,6 +198,10 @@ mod tests {
         Err("needs administrator".into())
     }
 
+    fn readable(_: &Path) -> std::io::Result<()> {
+        Ok(())
+    }
+
     fn fake_walk(_: &Path, _: &AtomicBool, _: &mut dyn FnMut(u64, u64)) -> (Tree, u64) {
         (tree(), 0)
     }
@@ -206,6 +219,7 @@ mod tests {
                 (tree(), 0)
             }),
             fs_name: Box::new(|_| "FAT32".into()),
+            root_check: Box::new(readable),
         }
     }
 
@@ -224,6 +238,7 @@ mod tests {
             mft: Box::new(failing_mft),
             walk: Box::new(fake_walk),
             fs_name: Box::new(|_| "NTFS".into()),
+            root_check: Box::new(readable),
         };
         let _handle = start_with(ScanTarget::Volume('C'), tx, no_repaint(), scanners);
         match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
@@ -263,9 +278,27 @@ mod tests {
                 (tree(), 0)
             }),
             fs_name: Box::new(|_| "NTFS".into()),
+            root_check: Box::new(readable),
         };
         let _handle = start_with(ScanTarget::Volume('C'), tx, no_repaint(), scanners);
         assert!(matches!(rx.recv_timeout(Duration::from_secs(5)), Err(RecvTimeoutError::Disconnected)));
         assert!(walk_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn unreadable_root_sends_failed_not_done() {
+        let (tx, rx) = channel();
+        let scanners = Scanners {
+            mft: Box::new(failing_mft),
+            walk: Box::new(fake_walk),
+            fs_name: Box::new(|_| "FAT32".into()),
+            root_check: Box::new(|_: &Path| Err(std::io::Error::from(std::io::ErrorKind::NotFound))),
+        };
+        let _handle = start_with(ScanTarget::Volume('Z'), tx, no_repaint(), scanners);
+        match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+            ScanEvent::Failed(message) => assert!(message.starts_with("cannot read Z:\\"), "{message}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert!(matches!(rx.recv_timeout(Duration::from_secs(2)), Err(RecvTimeoutError::Disconnected)));
     }
 }

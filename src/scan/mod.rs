@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use windows::core::PCWSTR;
 use windows::Win32::Storage::FileSystem::GetVolumeInformationW;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ScanTarget {
     Volume(char),
     Folder(PathBuf),

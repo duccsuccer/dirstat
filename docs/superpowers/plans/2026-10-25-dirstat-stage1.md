@@ -101,7 +101,7 @@ Each line below has a test in the owning task.
 - Produces (`scan/mod.rs`):
   - `pub enum ScanTarget { Volume(char), Folder(PathBuf) }`
   - `pub enum ScanMode { Mft, Walk }`
-  - `pub enum ScanEvent { Progress { files: u64, bytes: u64 }, Partial(Tree), Done { tree: Tree, mode: ScanMode, skipped: u64 }, Failed(String) }`
+  - `pub enum ScanEvent { Progress { files: u64, bytes: u64 }, Done { tree: Tree, mode: ScanMode, skipped: u64 }, Failed(String) }`
 - Produces (`walk.rs`): `pub fn walk(root: &Path, cancel: &AtomicBool, on_progress: &mut dyn FnMut(u64, u64)) -> (Tree, u64)`; the `u64` is the number of unreadable entries skipped.
 
 - [ ] **Step 1: Write failing tests** in `walk.rs` using `tempfile`:
@@ -167,7 +167,7 @@ Each line below has a test in the owning task.
 
 **Interfaces:**
 - Consumes: `walk`, `scan_volume`.
-- Produces: `pub fn choose_mode(target: &ScanTarget, fs_name: &str) -> ScanMode` (`Mft` when `fs_name == "NTFS"`, otherwise `Walk`); `pub fn start(target: ScanTarget, tx: Sender<ScanEvent>, ctx: egui::Context) -> ScanHandle`; `pub struct ScanHandle { cancel: Arc<AtomicBool> }` with `cancel(&self)`, also cancelled on `Drop`. The scan thread sends `Progress` at most every 100 ms, calls `ctx.request_repaint()` after each send, and falls back to `Walk` (reporting `mode: Walk`) when `scan_volume` returns `Err`. Walk mode sends a `Partial` tree about every 500 ms; MFT mode sends `Progress` only and the tree arrives with `Done`.
+- Produces: `pub fn choose_mode(target: &ScanTarget, fs_name: &str) -> ScanMode` (`Mft` when `fs_name == "NTFS"`, otherwise `Walk`); `pub fn start(target: ScanTarget, tx: Sender<ScanEvent>, ctx: egui::Context) -> ScanHandle`; `pub struct ScanHandle { cancel: Arc<AtomicBool> }` with `cancel(&self)`, also cancelled on `Drop`. The scan thread sends `Progress` at most every 100 ms, calls `ctx.request_repaint()` after each send, and falls back to `Walk` (reporting `mode: Walk`) when `scan_volume` returns `Err`. Both modes send `Progress` only; the tree arrives with `Done`. (Ruling: no mid-scan tree snapshots in stage 1, for either mode.)
 
 - [ ] **Step 1: Write failing tests:** `ntfs_chooses_mft_others_walk`, `mft_error_falls_back_to_walk` (inject a failing scanner function; `Done.mode == Walk`), `cancel_suppresses_done` (cancel immediately; no `Done` arrives within 2 s), `drop_cancels`.
 - [ ] **Step 2:** Run `cargo test scan::` and see them fail.
@@ -186,7 +186,7 @@ Each line below has a test in the owning task.
 **Interfaces:**
 - Produces: `pub struct AppState { pub tree: Option<Tree>, pub selected: Option<NodeId>, pub expanded: HashSet<NodeId>, pub mode: Option<ScanMode>, pub progress: (u64, u64), pub scan: Option<ScanHandle>, pub rx: Receiver<ScanEvent>, pub target: Option<ScanTarget>, pub error: Option<String> }`; `impl eframe::App for AppState`; `AppState::begin_scan(&mut self, target: ScanTarget, ctx: &egui::Context)` (drops the old `ScanHandle`, which cancels it, and replaces `rx` with a fresh channel so stale events can never arrive); `AppState::pump(&mut self)` applies queued events. Each pane module exposes `pub fn show(ui: &mut egui::Ui, state: &mut AppState)`.
 
-- [ ] **Step 1: Write failing tests** (no GUI needed): `stale_events_after_rescan_are_ignored` (`begin_scan` twice; an event sent on the first channel never changes state), `partial_event_replaces_tree`, `done_event_sets_tree_and_mode`, `failed_event_sets_error`.
+- [ ] **Step 1: Write failing tests** (no GUI needed): `stale_events_after_rescan_are_ignored` (`begin_scan` twice; an event sent on the first channel never changes state), `progress_event_updates_counters`, `done_event_sets_tree_and_mode`, `failed_event_sets_error`.
 - [ ] **Step 2:** Run `cargo test app` and see them fail.
 - [ ] **Step 3:** Implement `AppState` and the top bar: drive dropdown (`GetLogicalDriveStringsW`), "Browse folder" (`rfd::FileDialog`), Rescan (disabled with no target), and a badge reading "Fast (MFT)" or "Fallback (walk)". Show the empty-state prompt until a target is chosen, and a progress line (`files`, bytes) while scanning. Lay the panes out as in the spec: tree top-left, legend top-right, treemap bottom (`egui::TopBottomPanel` and `SidePanel`).
 - [ ] **Step 4:** Run `cargo test app` and see them pass. Then, from an elevated shell, `cargo run` and confirm the window opens, the drive dropdown lists drives, and nothing scans until a target is chosen.
@@ -214,7 +214,7 @@ Each line below has a test in the owning task.
 ### Task 9: Treemap pane and linked selection
 
 **Files:**
-- Modify: `src/ui_treemap.rs`
+- Modify: `src/ui_treemap.rs`, `src/app.rs` (add the layout-cache field to `AppState`)
 
 **Interfaces:**
 - Consumes: `treemap::layout`, `color_for`, `ensure_visible`.
@@ -232,7 +232,7 @@ Each line below has a test in the owning task.
 
 **Files:**
 - Create: `src/actions.rs`
-- Modify: `src/ui_tree.rs`, `src/ui_treemap.rs` (context menu on rows and blocks)
+- Modify: `src/app.rs` (`delete_selected`), `src/ui_tree.rs`, `src/ui_treemap.rs` (context menu on rows and blocks)
 
 **Interfaces:**
 - Produces: `pub fn open_in_explorer(path: &Path) -> std::io::Result<()>` (runs `explorer.exe /select,<path>`); `pub fn copy_path(path: &str) -> Result<(), String>` (`arboard`); `pub enum DeleteOutcome { Recycled, Refused(String), Failed(String) }`; `pub fn recycle(path: &Path) -> DeleteOutcome` using `IFileOperation` with `FOF_ALLOWUNDO | FOFX_RECYCLEONDELETE` and no UI of its own, so an item that cannot be recycled is reported as `Refused` and never permanently deleted. `AppState::delete_selected(&mut self, confirmed: bool)` calls `recycle` and, only on `Recycled`, calls `Tree::remove` and invalidates the cached layout.

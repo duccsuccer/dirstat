@@ -246,7 +246,7 @@ impl eframe::App for AppState {
         }
         // 1px lines between the panes, drawn on the edges where two panes meet.
         let line = egui::Stroke::new(1.0, palette(ui.visuals().dark_mode).separator);
-        let top = egui::Panel::top("top_bar").frame(panel_frame(ui, egui::Margin::symmetric(32, 24))).show(ui, |ui| top_bar(ui, self)).response.rect;
+        let top = egui::Panel::top("top_bar").frame(panel_frame(ui, egui::Margin::symmetric(16, 10))).show(ui, |ui| top_bar(ui, self)).response.rect;
         ui.painter().hline(top.x_range(), top.bottom() - 0.5, line);
         let status = egui::Panel::bottom("status")
             .frame(panel_frame(ui, egui::Margin::symmetric(16, 3)))
@@ -346,47 +346,74 @@ fn top_bar(ui: &mut egui::Ui, state: &mut AppState) {
     let pal = palette(ui.visuals().dark_mode);
     let drive_id = egui::Id::unique("drive_choice");
     let mut choice: Option<char> = ui.data(|d| d.get_temp(drive_id)).flatten();
-    ui.horizontal(|ui| {
-        let scan = choice.map_or("Scan".to_string(), |letter| format!("Scan {letter}:"));
-        if accent_button(ui, &scan, choice.is_some()).clicked() {
-            if let Some(letter) = choice {
-                state.begin_scan(ScanTarget::Volume(letter), ui.ctx());
-            }
-        }
-        ui.scope(|ui| {
-            ui.visuals_mut().widgets.inactive.fg_stroke.color = pal.muted;
-            ui.menu_button("Change drive", |ui| {
-                for letter in logical_drives() {
-                    if ui.button(format!("{letter}:")).clicked() {
-                        choice = Some(letter);
-                        ui.close();
+    // Left: the buttons, with the status and progress line under them as wide as the buttons.
+    // Right: the selection and the volume's space, behind a divider.
+    let split = ui.horizontal_top(|ui| {
+        let left = ui
+            .vertical(|ui| {
+                let buttons = ui.horizontal(|ui| {
+                    let scan = choice.map_or("Scan".to_string(), |letter| format!("Scan {letter}:"));
+                    if accent_button(ui, &scan, choice.is_some()).clicked() {
+                        if let Some(letter) = choice {
+                            state.begin_scan(ScanTarget::Volume(letter), ui.ctx());
+                        }
                     }
+                    ui.scope(|ui| {
+                        ui.visuals_mut().widgets.inactive.fg_stroke.color = pal.muted;
+                        ui.menu_button("Change drive", |ui| {
+                            for letter in logical_drives() {
+                                if ui.button(format!("{letter}:")).clicked() {
+                                    choice = Some(letter);
+                                    ui.close();
+                                }
+                            }
+                        });
+                    });
+                    if link(ui, "Browse folder", true).clicked() {
+                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                            state.begin_scan(ScanTarget::Folder(path), ui.ctx());
+                        }
+                    }
+                    if link(ui, "Rescan", state.target.is_some()).clicked() {
+                        if let Some(target) = state.target.clone() {
+                            state.begin_scan(target, ui.ctx());
+                        }
+                    }
+                });
+                let fraction = progress_fraction(state);
+                ui.colored_label(pal.muted, status_text(state));
+                ui.add(
+                    egui::ProgressBar::new(fraction.unwrap_or(0.0))
+                        .desired_width(buttons.response.rect.width())
+                        .desired_height(3.0)
+                        .animate(fraction.is_none()),
+                );
+                if let Some(error) = &state.error {
+                    ui.colored_label(pal.error, error);
                 }
-            });
-        });
-        if link(ui, "Browse folder", true).clicked() {
-            if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                state.begin_scan(ScanTarget::Folder(path), ui.ctx());
-            }
-        }
-        if link(ui, "Rescan", state.target.is_some()).clicked() {
-            if let Some(target) = state.target.clone() {
-                state.begin_scan(target, ui.ctx());
-            }
-        }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.colored_label(pal.muted, disk_summary(state.disk));
-        });
+            })
+            .response
+            .rect;
+        ui.add_space(24.0);
+        ui.vertical(|ui| info_grid(ui, state));
+        left.right() + 12.0
     });
+    ui.painter().vline(split.inner, split.response.rect.y_range(), egui::Stroke::new(1.0, pal.separator));
     ui.data_mut(|d| d.insert_temp(drive_id, choice));
-    let selection = state.tree.as_ref().map(|t| actions::shell_path(t.path(state.selected.unwrap_or(t.root))));
-    ui.colored_label(pal.muted, selection.unwrap_or_default());
-    ui.colored_label(pal.muted, status_text(state));
-    let fraction = progress_fraction(state);
-    ui.add(egui::ProgressBar::new(fraction.unwrap_or(0.0)).desired_height(3.0).animate(fraction.is_none()));
-    if let Some(error) = &state.error {
-        ui.colored_label(pal.error, error);
-    }
+}
+
+/// The selection path and the volume's total, used and free space: muted labels with their values.
+fn info_grid(ui: &mut egui::Ui, state: &AppState) {
+    let pal = palette(ui.visuals().dark_mode);
+    let selection = state.tree.as_ref().map(|t| actions::shell_path(t.path(state.selected.unwrap_or(t.root)))).unwrap_or_default();
+    let [total, used, free] = disk_fields(state.disk);
+    egui::Grid::new("top_info").num_columns(2).spacing([16.0, 2.0]).show(ui, |ui| {
+        for (label, value) in [("Selection path", selection), total, used, free] {
+            ui.colored_label(pal.muted, label);
+            ui.add(egui::Label::new(value).truncate());
+            ui.end_row();
+        }
+    });
 }
 
 /// The line over the progress bar: live counters while scanning, then how the last scan went.
@@ -421,15 +448,18 @@ fn progress_fraction(state: &AppState) -> Option<f32> {
     (used > 0).then(|| (state.progress.1 as f32 / used as f32).min(0.99))
 }
 
-/// The volume's used, free and total space on one line, e.g. `833.3 GB used · 97.1 GB free · 930.4 GB`.
-fn disk_summary(disk: Option<(u64, u64)>) -> String {
-    let Some((total, free)) = disk else { return String::new() };
-    format!(
-        "{} used · {} free · {}",
-        ui_tree::format_size(total.saturating_sub(free)),
-        ui_tree::format_size(free),
-        ui_tree::format_size(total)
-    )
+/// The volume's total, used and free space as label and value pairs; used and free also as a share of the total.
+fn disk_fields(disk: Option<(u64, u64)>) -> [(&'static str, String); 3] {
+    let Some((total, free)) = disk else {
+        return [("Total space", String::new()), ("Space used", String::new()), ("Space free", String::new())];
+    };
+    let used = total.saturating_sub(free);
+    let share = |n: u64| if total == 0 { 0.0 } else { n as f32 * 100.0 / total as f32 };
+    [
+        ("Total space", ui_tree::format_size(total)),
+        ("Space used", format!("{} ({:.1} %)", ui_tree::format_size(used), share(used))),
+        ("Space free", format!("{} ({:.1} %)", ui_tree::format_size(free), share(free))),
+    ]
 }
 
 /// Item `id`'s items, files and folders as the tree counts them (a file is one item and one file).
@@ -887,10 +917,17 @@ mod tests {
     }
 
     #[test]
-    fn disk_summary_shows_used_free_and_total() {
+    fn disk_fields_show_total_used_and_free_with_shares() {
         let gb = 1024 * 1024 * 1024;
-        assert_eq!(disk_summary(Some((1000 * gb, 250 * gb))), "750.0 GB used · 250.0 GB free · 1000.0 GB");
-        assert_eq!(disk_summary(None), "");
+        assert_eq!(
+            disk_fields(Some((1000 * gb, 250 * gb))),
+            [
+                ("Total space", "1000.0 GB".to_string()),
+                ("Space used", "750.0 GB (75.0 %)".to_string()),
+                ("Space free", "250.0 GB (25.0 %)".to_string()),
+            ]
+        );
+        assert_eq!(disk_fields(None)[1].1, "");
     }
 
     #[test]

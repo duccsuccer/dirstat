@@ -1,28 +1,56 @@
 //! Treemap pane (bottom).
 
-use eframe::egui::{self, Color32, Pos2, Sense, Stroke, StrokeKind, Vec2};
+use eframe::egui::{self, Color32, Mesh, Pos2, Sense, Shape, Vec2};
 use crate::app::AppState;
 use crate::model::{NodeId, Tree};
 use crate::treemap;
 use crate::ui_legend::color_for;
 use crate::ui_tree::{ensure_visible, format_size, placeholder};
+use std::sync::Arc;
 
-/// Layout of the pane at one size. `highlight` outlines the selection and is refreshed only when `selected` changes.
+/// Above this many selected blocks the outline is one bounding box, so a huge selection costs no more than a small one.
+const HIGHLIGHT_LIMIT: usize = 2000;
+const OUTLINE_W: f32 = 2.0;
+
+/// Layout of the pane at one size. Both meshes are kept in absolute screen coordinates, placed at `origin`.
+/// `highlight` outlines the selection and is refreshed only when `selected` changes.
 pub struct TreemapCache {
     pub size: (f32, f32),
     pub blocks: Vec<(NodeId, treemap::Rect)>,
+    pub mesh: Arc<Mesh>,
+    pub origin: Pos2,
     pub highlight_for: Option<NodeId>,
-    pub highlight: Vec<treemap::Rect>,
+    pub highlight: Arc<Mesh>,
 }
 
 impl TreemapCache {
     fn new(tree: &Tree, size: (f32, f32)) -> Self {
         let bounds = treemap::Rect { x: 0.0, y: 0.0, w: size.0, h: size.1 };
+        let blocks = treemap::layout(tree, tree.root, bounds);
+        let mut mesh = Mesh::default();
+        for (id, b) in &blocks {
+            mesh.add_colored_rect(
+                egui::Rect::from_min_size(Pos2::new(b.x, b.y), Vec2::new(b.w, b.h)),
+                color_for(tree.nodes[id.0 as usize].ext),
+            );
+        }
         Self {
             size,
-            blocks: treemap::layout(tree, tree.root, bounds),
+            blocks,
+            mesh: Arc::new(mesh),
+            origin: Pos2::ZERO,
             highlight_for: None,
-            highlight: Vec::new(),
+            highlight: Arc::new(Mesh::default()),
+        }
+    }
+
+    /// Moves both meshes to `origin`. Costs a pass over the vertices only when the pane has moved.
+    fn place(&mut self, origin: Pos2) {
+        if origin != self.origin {
+            let delta = origin - self.origin;
+            Arc::make_mut(&mut self.mesh).translate(delta);
+            Arc::make_mut(&mut self.highlight).translate(delta);
+            self.origin = origin;
         }
     }
 }
@@ -37,21 +65,19 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
     let origin = response.rect.min;
 
     let size = (size.x, size.y);
-    if state.treemap_cache.as_ref().is_some_and(|c| c.size != size) {
+    if needs_relayout(state.treemap_cache.as_ref().map(|c| c.size), size) {
         state.treemap_cache = None;
     }
     let cache = state.treemap_cache.get_or_insert_with(|| TreemapCache::new(tree, size));
+    cache.place(origin);
     if cache.highlight_for != state.selected {
-        cache.highlight = state.selected.map_or_else(Vec::new, |id| blocks_under(tree, &cache.blocks, id));
+        let rects = state.selected.map_or_else(Vec::new, |id| blocks_under(tree, &cache.blocks, id));
+        cache.highlight = Arc::new(outline_mesh(&highlight_outline_rects(&rects), origin));
         cache.highlight_for = state.selected;
     }
 
-    for (id, block) in &cache.blocks {
-        painter.rect_filled(block_rect(origin, block), 0.0, color_for(tree.nodes[id.0 as usize].ext));
-    }
-    for block in &cache.highlight {
-        painter.rect_stroke(block_rect(origin, block), 0.0, Stroke::new(2.0, Color32::WHITE), StrokeKind::Inside);
-    }
+    painter.add(Shape::Mesh(Arc::clone(&cache.mesh)));
+    painter.add(Shape::Mesh(Arc::clone(&cache.highlight)));
 
     let hit = |pos: Pos2| hit_test(&cache.blocks, pos.x - origin.x, pos.y - origin.y);
     if response.clicked() {
@@ -59,6 +85,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
             state.selected = Some(id);
             ensure_visible(tree, &mut state.expanded, id);
             state.scroll_to_selected = true;
+            ui.ctx().request_repaint();
         }
     }
     if let Some(id) = response.hover_pos().and_then(hit) {
@@ -71,8 +98,43 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
     }
 }
 
-fn block_rect(origin: Pos2, block: &treemap::Rect) -> egui::Rect {
-    egui::Rect::from_min_size(origin + Vec2::new(block.x, block.y), Vec2::new(block.w, block.h))
+/// True when the pane must be laid out again. Sizes equal after rounding to whole pixels count as unchanged.
+pub fn needs_relayout(old: Option<(f32, f32)>, new: (f32, f32)) -> bool {
+    old.map_or(true, |o| o.0.round() != new.0.round() || o.1.round() != new.1.round())
+}
+
+/// The outline rects to draw: the rects themselves up to `HIGHLIGHT_LIMIT`, past it one box around all of them.
+pub fn highlight_outline_rects(rects: &[treemap::Rect]) -> Vec<treemap::Rect> {
+    if rects.len() <= HIGHLIGHT_LIMIT {
+        return rects.to_vec();
+    }
+    let (mut x0, mut y0, mut x1, mut y1) = (f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for r in rects {
+        x0 = x0.min(r.x);
+        y0 = y0.min(r.y);
+        x1 = x1.max(r.x + r.w);
+        y1 = y1.max(r.y + r.h);
+    }
+    vec![treemap::Rect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }]
+}
+
+/// Four thin white edges per rect, in absolute coordinates for a pane at `origin`.
+fn outline_mesh(rects: &[treemap::Rect], origin: Pos2) -> Mesh {
+    let mut mesh = Mesh::default();
+    for r in rects {
+        let min = origin + Vec2::new(r.x, r.y);
+        let max = min + Vec2::new(r.w, r.h);
+        let t = OUTLINE_W;
+        for edge in [
+            egui::Rect::from_min_max(min, Pos2::new(max.x, min.y + t)),
+            egui::Rect::from_min_max(Pos2::new(min.x, max.y - t), max),
+            egui::Rect::from_min_max(min, Pos2::new(min.x + t, max.y)),
+            egui::Rect::from_min_max(Pos2::new(max.x - t, min.y), max),
+        ] {
+            mesh.add_colored_rect(edge, Color32::WHITE);
+        }
+    }
+    mesh
 }
 
 /// The block containing (`x`, `y`), in the same local coordinates as `blocks`; `None` over a gap.
@@ -148,5 +210,29 @@ mod tests {
         let tree = b.finish();
         let blocks = [(g, block(0.0, 0.0, 1.0, 1.0)), (other, block(1.0, 0.0, 1.0, 1.0))];
         assert_eq!(blocks_under(&tree, &blocks, g), vec![block(0.0, 0.0, 1.0, 1.0)]);
+    }
+
+    #[test]
+    fn needs_relayout_ignores_subpixel_jitter() {
+        assert!(!needs_relayout(Some((100.0, 50.0)), (100.4, 49.6)));
+    }
+
+    #[test]
+    fn needs_relayout_true_when_none_or_size_changes() {
+        assert!(needs_relayout(None, (100.0, 50.0)));
+        assert!(needs_relayout(Some((100.0, 50.0)), (101.0, 50.0)));
+        assert!(needs_relayout(Some((100.0, 50.0)), (100.0, 51.0)));
+    }
+
+    #[test]
+    fn few_highlights_stay_individual() {
+        let rects = [block(0.0, 0.0, 1.0, 1.0), block(5.0, 5.0, 2.0, 2.0)];
+        assert_eq!(highlight_outline_rects(&rects), rects.to_vec());
+    }
+
+    #[test]
+    fn many_highlights_collapse_to_bounding_box() {
+        let rects: Vec<treemap::Rect> = (0..2001).map(|i| block(i as f32, 0.0, 1.0, 1.0)).collect();
+        assert_eq!(highlight_outline_rects(&rects), vec![block(0.0, 0.0, 2001.0, 1.0)]);
     }
 }

@@ -122,8 +122,10 @@ fn apply_fixups(buf: &mut [u8]) -> Option<()> {
 /// (allocated, logical) from an unnamed $DATA attribute.
 fn data_sizes(attr: &[u8], non_resident: bool) -> Option<(u64, u64)> {
     if non_resident {
-        // @0x28 is the virtual size rounded up; compressed or sparse streams report the stored size at @0x40.
-        let allocated = if u16_at(attr, 0x22)? != 0 && attr.len() >= 0x48 {
+        // @0x28 is the virtual size rounded up; compressed or sparse streams (attribute flags 0x0001 | 0x8000, as
+        // ntfs-3g and TSK decide; sparse files may have compression unit 0) report the stored size at @0x40.
+        let stored = u16_at(attr, 0x0C)? & (0x0001 | 0x8000) != 0;
+        let allocated = if stored && attr.len() >= 0x48 {
             u64_at(attr, 0x40)?
         } else {
             u64_at(attr, 0x28)?
@@ -218,9 +220,9 @@ mod tests {
     }
 
     /// Compressed or sparse non-resident $DATA: compression unit @0x22 and on-disk size @0x40.
-    fn compressed_attr(attr_flags: u16, allocated: u64, real: u64, compressed: u64) -> Vec<u8> {
+    fn compressed_attr(attr_flags: u16, unit: u16, allocated: u64, real: u64, compressed: u64) -> Vec<u8> {
         let mut a = nonresident_attr(TYPE_DATA, attr_flags, allocated, real);
-        put(&mut a, 0x22, &4u16.to_le_bytes());
+        put(&mut a, 0x22, &unit.to_le_bytes());
         put(&mut a, 0x40, &compressed.to_le_bytes());
         a
     }
@@ -324,13 +326,30 @@ mod tests {
 
     #[test]
     fn sparse_and_compressed_use_compressed_size_on_disk() {
-        for attr_flags in [0x8000u16, 0x0001] {
-            let data = compressed_attr(attr_flags, 1_048_576, 1_000_000, 65_536);
+        // Sparse files may have compression unit 0; the attribute flags decide, not the unit.
+        for (attr_flags, unit) in [(0x8000u16, 0u16), (0x8000, 4), (0x0001, 4)] {
+            let data = compressed_attr(attr_flags, unit, 1_048_576, 1_000_000, 65_536);
             let mut rec = make_record(FLAG_IN_USE, &[(5, NS_WIN32, "sparse.bin")], &[data]);
             let r = parse_record(&mut rec, 1).expect("record should parse");
-            assert_eq!(r.allocated, 65_536);
+            assert_eq!(r.allocated, 65_536, "flags {attr_flags:#x}, unit {unit}");
             assert_eq!(r.logical, 1_000_000);
         }
+    }
+
+    #[test]
+    fn plain_data_ignores_compression_unit() {
+        let data = compressed_attr(0, 4, 8192, 5000, 65_536);
+        let mut rec = make_record(FLAG_IN_USE, &[(5, NS_WIN32, "plain.bin")], &[data]);
+        assert_eq!(parse_record(&mut rec, 1).expect("record should parse").allocated, 8192);
+    }
+
+    #[test]
+    fn flagged_data_too_short_for_compressed_size_uses_allocated() {
+        let mut data = nonresident_attr(TYPE_DATA, 0x8000, 8192, 5000);
+        data.truncate(0x40);
+        put(&mut data, 4, &0x40u32.to_le_bytes());
+        let mut rec = make_record(FLAG_IN_USE, &[(5, NS_WIN32, "short.bin")], &[data]);
+        assert_eq!(parse_record(&mut rec, 1).expect("record should parse").allocated, 8192);
     }
 
     #[test]

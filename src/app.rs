@@ -106,7 +106,7 @@ impl AppState {
             return;
         }
         let path = actions::shell_path(tree.path(id));
-        let items = [(AppItem::Explore, true), (AppItem::CommandPrompt, true)];
+        let items = [(AppItem::Explore, true), (AppItem::CommandPrompt, true), (AppItem::CopyPath, true)];
         match actions::show_context_menu(HWND(self.hwnd as *mut _), Path::new(&path), extended, &items, has_shell_menu(tree, id)) {
             Ok(Chosen::Shell) => self.forget_if_gone(id, exists),
             Ok(Chosen::App(item)) => self.app_item(id, item),
@@ -123,6 +123,7 @@ impl AppState {
         let result = match item {
             AppItem::Explore => actions::explore(Path::new(&path), !tree.nodes[id.0 as usize].is_dir).map_err(|e| format!("{path}: {e}")),
             AppItem::CommandPrompt => actions::command_prompt(Path::new(&dir)).map_err(|e| format!("{dir}: {e}")),
+            AppItem::CopyPath => actions::copy_path(&path).map_err(|e| format!("{path}: {e}")),
         };
         if let Err(e) = result {
             self.error = Some(e);

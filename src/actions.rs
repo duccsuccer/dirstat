@@ -53,15 +53,17 @@ const SUBCLASS_ID: usize = 1;
 pub enum AppItem {
     Explore,
     CommandPrompt,
+    CopyPath,
 }
 
 impl AppItem {
-    const ALL: [AppItem; 2] = [AppItem::Explore, AppItem::CommandPrompt];
+    const ALL: [AppItem; 3] = [AppItem::Explore, AppItem::CommandPrompt, AppItem::CopyPath];
 
     fn label(self) -> &'static str {
         match self {
             AppItem::Explore => "Explore Folder",
             AppItem::CommandPrompt => "Command Prompt Here",
+            AppItem::CopyPath => "Copy Path",
         }
     }
 

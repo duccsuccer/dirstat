@@ -54,17 +54,19 @@ pub enum AppItem {
     Explore,
     CommandPrompt,
     CopyPath,
+    Export,
     CopyInfo,
 }
 
 impl AppItem {
-    const ALL: [AppItem; 4] = [AppItem::Explore, AppItem::CommandPrompt, AppItem::CopyPath, AppItem::CopyInfo];
+    const ALL: [AppItem; 5] = [AppItem::Explore, AppItem::CommandPrompt, AppItem::CopyPath, AppItem::Export, AppItem::CopyInfo];
 
     fn label(self) -> &'static str {
         match self {
             AppItem::Explore => "Explore Folder",
             AppItem::CommandPrompt => "Command Prompt Here",
             AppItem::CopyPath => "Copy Path",
+            AppItem::Export => "Export to .CSV file...",
             AppItem::CopyInfo => "Copy file and size info to clipboard",
         }
     }

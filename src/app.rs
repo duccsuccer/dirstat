@@ -106,7 +106,13 @@ impl AppState {
             return;
         }
         let path = actions::shell_path(tree.path(id));
-        let items = [(AppItem::Explore, true), (AppItem::CommandPrompt, true), (AppItem::CopyPath, true), (AppItem::CopyInfo, true)];
+        let items = [
+            (AppItem::Explore, true),
+            (AppItem::CommandPrompt, true),
+            (AppItem::CopyPath, true),
+            (AppItem::Export, true),
+            (AppItem::CopyInfo, true),
+        ];
         match actions::show_context_menu(HWND(self.hwnd as *mut _), Path::new(&path), extended, &items, has_shell_menu(tree, id)) {
             Ok(Chosen::Shell) => self.forget_if_gone(id, exists),
             Ok(Chosen::App(item)) => self.app_item(id, item),
@@ -124,6 +130,17 @@ impl AppState {
             AppItem::Explore => actions::explore(Path::new(&path), !tree.nodes[id.0 as usize].is_dir).map_err(|e| format!("{path}: {e}")),
             AppItem::CommandPrompt => actions::command_prompt(Path::new(&dir)).map_err(|e| format!("{dir}: {e}")),
             AppItem::CopyPath => actions::copy_text(&path).map_err(|e| format!("{path}: {e}")),
+            AppItem::Export => {
+                // Cancelling the dialog is not an error.
+                let Some(file) = rfd::FileDialog::new()
+                    .set_file_name("dirstat-export.csv")
+                    .add_filter("CSV", &["csv"])
+                    .save_file()
+                else {
+                    return;
+                };
+                std::fs::write(&file, csv_export(tree, id)).map_err(|e| format!("{}: {e}", file.display()))
+            }
             AppItem::CopyInfo => actions::copy_text(&info_line(tree, id)).map_err(|e| format!("{path}: {e}")),
         };
         if let Err(e) = result {
@@ -403,6 +420,39 @@ pub fn info_line(tree: &Tree, id: NodeId) -> String {
     .join("\t")
 }
 
+/// The CSV file Export writes for item `id` and everything below it: a header, then one row per folder and file,
+/// `id` first and then in tree order. UTF-8 with a byte order mark, CRLF line ends.
+pub fn csv_export(tree: &Tree, id: NodeId) -> String {
+    let mut out = String::from("\u{feff}Path,Size,Allocated,Items,Files,Folders\r\n");
+    let mut stack = vec![id];
+    while let Some(current) = stack.pop() {
+        let node = &tree.nodes[current.0 as usize];
+        let (items, files, folders) = counts(tree, current);
+        let fields = [
+            csv_field(&actions::shell_path(tree.path(current))),
+            node.logical.to_string(),
+            node.size.to_string(),
+            items.to_string(),
+            files.to_string(),
+            folders.to_string(),
+        ];
+        out += &fields.join(",");
+        out += "\r\n";
+        // Pushed in reverse so the children come out in tree order.
+        stack.extend(node.children.iter().rev().copied());
+    }
+    out
+}
+
+/// `s` as one RFC 4180 field: quoted when it holds a comma, a quote or a line break, with its quotes doubled.
+fn csv_field(s: &str) -> String {
+    if s.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
 /// The status line under the treemap for item `id`: how many files it holds (1 for a file), its logical size and
 /// its size on disk.
 pub fn selection_status(tree: &Tree, id: NodeId) -> String {
@@ -588,6 +638,30 @@ mod tests {
         assert_eq!(info_line(tree, f), "C:\\a\\f.bin\t10\t10\t1\t1\t0");
         assert_eq!(info_line(tree, a), "C:\\a\t10\t10\t1\t1\t0");
         assert_eq!(info_line(tree, tree.root), "C:\\\t17\t17\t3\t2\t1");
+    }
+
+    #[test]
+    fn csv_export_has_bom_header_and_one_row_per_item() {
+        let mut b = TreeBuilder::new("C:");
+        let dir = b.add(NodeId(0), "a, \"b\"", true, 0, 0);
+        b.add(dir, "line\nbreak.txt", false, 10, 8);
+        b.add(NodeId(0), "plain.bin", false, 7, 7);
+        let tree = b.finish();
+        let expected = "\u{feff}Path,Size,Allocated,Items,Files,Folders\r\n\
+            C:\\,15,17,3,2,1\r\n\
+            \"C:\\a, \"\"b\"\"\",8,10,1,1,0\r\n\
+            \"C:\\a, \"\"b\"\"\\line\nbreak.txt\",8,10,1,1,0\r\n\
+            C:\\plain.bin,7,7,1,1,0\r\n";
+        assert_eq!(csv_export(&tree, tree.root), expected);
+        assert_eq!(&csv_export(&tree, tree.root).as_bytes()[..3], [0xEF, 0xBB, 0xBF]);
+    }
+
+    #[test]
+    fn csv_field_quotes_only_what_needs_it() {
+        assert_eq!(csv_field("plain"), "plain");
+        assert_eq!(csv_field("a,b"), "\"a,b\"");
+        assert_eq!(csv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
+        assert_eq!(csv_field("two\r\nlines"), "\"two\r\nlines\"");
     }
 
     #[test]

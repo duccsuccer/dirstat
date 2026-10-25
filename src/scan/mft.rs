@@ -13,7 +13,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
 use windows::Win32::Foundation::{ERROR_MORE_DATA, HANDLE};
 use windows::Win32::Storage::FileSystem::{
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_NO_BUFFERING, FILE_FLAG_SEQUENTIAL_SCAN, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
 };
 use windows::Win32::System::Ioctl::{
     FSCTL_GET_NTFS_VOLUME_DATA, FSCTL_GET_RETRIEVAL_POINTERS, NTFS_VOLUME_DATA_BUFFER, STARTING_VCN_INPUT_BUFFER,
@@ -26,7 +26,8 @@ const ROOT_RECORD: u64 = 5;
 const FIRST_USER_RECORD: u64 = 24;
 /// Bytes per MFT read; a power of two, so a whole number of records.
 const CHUNK_BYTES: u64 = 4 << 20;
-/// Raw volume reads are uncached, so buffers are aligned to at least this (and to the sector size).
+/// The volume is opened with `FILE_FLAG_NO_BUFFERING`, so read buffers are aligned to at least this (and to the
+/// sector size); offsets and lengths are sector multiples by construction.
 const MIN_BUFFER_ALIGN: u64 = 4096;
 const PROGRESS_EVERY: Duration = Duration::from_millis(100);
 const SHARE_ALL: u32 = FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0 | FILE_SHARE_DELETE.0;
@@ -55,7 +56,7 @@ struct Chunk {
 }
 
 /// Scans NTFS volume `letter` by reading its MFT (needs administrator rights). With `subtree`, keeps only
-/// that folder and its descendants. Calls `on_progress` about every 100 ms with running file and allocated-byte
+/// that folder and its descendants; the root is named as `walk` names it (see `root_name`). Calls `on_progress` about every 100 ms with running file and allocated-byte
 /// totals. Returns `Err` when the volume cannot be opened, is not NTFS, a read fails, or `cancel` is set.
 pub fn scan_volume(
     letter: char,
@@ -70,6 +71,8 @@ pub fn scan_volume(
     let volume = OpenOptions::new()
         .read(true)
         .share_mode(SHARE_ALL)
+        // Uncached: cached volume pages can be stale, since NTFS writes its metadata by another path.
+        .custom_flags(FILE_FLAG_NO_BUFFERING.0 | FILE_FLAG_SEQUENTIAL_SCAN.0)
         .open(format!(r"\\.\{letter}:"))
         .map_err(|e| format!("cannot open volume {letter}: ({e})"))?;
     let data = volume_data(&volume).map_err(|e| format!("{letter}: is not a readable NTFS volume ({e})"))?;
@@ -86,10 +89,11 @@ pub fn scan_volume(
     if cancel.load(Ordering::Relaxed) {
         return Err("scan cancelled".into());
     }
-    build_tree(records, letter, &folder)
+    build_tree(records, &root_name(letter, subtree), &folder)
 }
 
 /// Path components of `path` below the root of volume `letter`, with links and short names resolved.
+/// Used only to find the folder in the MFT, never to name it.
 fn folder_components(letter: char, path: &Path) -> Result<Vec<String>, String> {
     let real = std::fs::canonicalize(path).map_err(|e| format!("cannot resolve {}: {e}", path.display()))?;
     let mut parts = real.components();
@@ -236,12 +240,21 @@ fn read_chunk(volume: &File, chunk: &Chunk, record: usize, align: usize) -> Resu
         .collect())
 }
 
-/// Rebuilds the folder tree from parsed records. `folder` holds the path components, below the volume root,
-/// of the folder to keep: the tree is rooted there and named after it. Empty keeps the whole volume, named
-/// after the drive (`C:`). Components match names exactly, as stored on disk. Metafiles, symlinks and
-/// junctions, and records whose parent chain never reaches the root are left out. Returns `Err` when
-/// `folder` is not a reachable directory.
-pub fn build_tree(records: Vec<MftRecord>, letter: char, folder: &[String]) -> Result<Tree, String> {
+/// The target as `walk` names it: `subtree` as given, made absolute, without `\\?\` or a trailing `\`
+/// (never canonicalized, so both scan modes name a target alike), or `X:` for the whole volume.
+fn root_name(letter: char, subtree: Option<&Path>) -> String {
+    let Some(path) = subtree else { return format!("{}:", letter.to_ascii_uppercase()) };
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let name = absolute.to_string_lossy();
+    name.strip_prefix(r"\\?\").unwrap_or(&name).trim_end_matches('\\').to_string()
+}
+
+/// Rebuilds the folder tree from parsed records, with its root named `root_name`. `folder` holds the path
+/// components, below the volume root, of the folder to keep: the tree is rooted there. Empty keeps the whole
+/// volume. Components match names exactly, as stored on disk. Metafiles, symlinks and junctions, and records
+/// whose parent chain never reaches the root are left out. Returns `Err` when `folder` is not a reachable
+/// directory.
+pub fn build_tree(records: Vec<MftRecord>, root_name: &str, folder: &[String]) -> Result<Tree, String> {
     // Links have nothing below them in the MFT, so dropping them also stops any descent through them.
     let mut kept: Vec<MftRecord> =
         records.into_iter().filter(|r| r.index >= FIRST_USER_RECORD && !r.is_reparse).collect();
@@ -260,8 +273,7 @@ pub fn build_tree(records: Vec<MftRecord>, letter: char, folder: &[String]) -> R
             .ok_or_else(|| format!("folder {} not found in the MFT", folder.join("\\")))?
             .index;
     }
-    let root_name = folder.last().cloned().unwrap_or_else(|| format!("{}:", letter.to_ascii_uppercase()));
-    let mut builder = TreeBuilder::new(&root_name);
+    let mut builder = TreeBuilder::new(root_name);
     // Iterative, so deep chains cannot overflow the stack. Each record sits under one parent, so none is
     // added twice, and orphans and parent cycles are never reached from `start`.
     let mut stack = vec![(start, NodeId(0))];
@@ -343,7 +355,7 @@ mod tests {
     #[test]
     fn whole_volume_root_is_named_after_drive() {
         let recs = vec![rec(30, 5, "a", true, 0), rec(31, 30, "f.txt", false, 4096)];
-        let t = build_tree(recs, 'C', &[]).unwrap();
+        let t = build_tree(recs, "C:", &[]).unwrap();
         assert_eq!(paths(&t), ["C:", "C:\\a", "C:\\a\\f.txt"]);
         let root = &t.nodes[t.root.0 as usize];
         assert_eq!((root.size, root.logical), (4096, 2048));
@@ -359,7 +371,7 @@ mod tests {
             rec(50, 51, "cycle_a", true, 0),
             rec(51, 50, "cycle_b", true, 0),
         ];
-        let t = build_tree(recs, 'C', &[]).unwrap();
+        let t = build_tree(recs, "C:", &[]).unwrap();
         assert_eq!(paths(&t), ["C:", "C:\\kept.bin"]);
     }
 
@@ -372,7 +384,7 @@ mod tests {
             rec(25, 11, "$Quota", false, 7),
             rec(30, 5, "user.txt", false, 3),
         ];
-        let t = build_tree(recs, 'C', &[]).unwrap();
+        let t = build_tree(recs, "C:", &[]).unwrap();
         assert_eq!(paths(&t), ["C:", "C:\\user.txt"]);
         assert_eq!(t.nodes[t.root.0 as usize].size, 3);
     }
@@ -385,7 +397,7 @@ mod tests {
             link(32, 5, "symlink.txt", false),
             rec(33, 5, "real.bin", false, 4),
         ];
-        let t = build_tree(recs, 'C', &[]).unwrap();
+        let t = build_tree(recs, "C:", &[]).unwrap();
         assert_eq!(paths(&t), ["C:", "C:\\real.bin"]);
     }
 
@@ -400,8 +412,8 @@ mod tests {
             rec(35, 30, "outside.bin", false, 999),
             rec(36, 5, "top.bin", false, 999),
         ];
-        let t = build_tree(recs, 'C', &comps(&["Users", "me"])).unwrap();
-        assert_eq!(paths(&t), ["me", "me\\a.bin", "me\\docs", "me\\docs\\b.bin"]);
+        let t = build_tree(recs, r"C:\Users\me", &comps(&["Users", "me"])).unwrap();
+        assert_eq!(paths(&t), [r"C:\Users\me", r"C:\Users\me\a.bin", r"C:\Users\me\docs", r"C:\Users\me\docs\b.bin"]);
         assert_eq!(t.nodes[t.root.0 as usize].size, 150);
     }
 
@@ -414,7 +426,7 @@ mod tests {
             link(42, 5, "junction", true),
         ];
         for path in [&["nope"][..], &["lost", "x"], &["top.bin"], &["junction"]] {
-            assert!(build_tree(recs.clone(), 'C', &comps(path)).is_err(), "{path:?}");
+            assert!(build_tree(recs.clone(), "C:", &comps(path)).is_err(), "{path:?}");
         }
     }
 
@@ -423,7 +435,7 @@ mod tests {
         const DEPTH: u64 = 100_000;
         let mut recs: Vec<MftRecord> = (0..DEPTH).map(|i| rec(24 + i, if i == 0 { 5 } else { 23 + i }, "d", true, 0)).collect();
         recs.push(rec(24 + DEPTH, 23 + DEPTH, "leaf.bin", false, 8));
-        let t = build_tree(recs, 'C', &[]).unwrap();
+        let t = build_tree(recs, "C:", &[]).unwrap();
         assert_eq!(t.nodes.len() as u64, DEPTH + 2);
         assert_eq!(t.nodes[t.root.0 as usize].size, 8);
     }
@@ -432,7 +444,7 @@ mod tests {
     fn non_bmp_and_long_names_survive() {
         let long = "x".repeat(255);
         let recs = vec![rec(30, 5, "\u{10348}.txt", false, 1), rec(31, 5, &long, false, 1)];
-        let t = build_tree(recs, 'C', &[]).unwrap();
+        let t = build_tree(recs, "C:", &[]).unwrap();
         assert!(t.nodes.iter().any(|n| n.name == "\u{10348}.txt"));
         assert!(t.nodes.iter().any(|n| n.name == long));
     }
@@ -516,6 +528,16 @@ mod tests {
     }
 
     #[test]
+    fn root_name_is_target_as_given_like_walk() {
+        assert_eq!(root_name('c', None), "C:");
+        assert_eq!(root_name('C', Some(Path::new(r"C:\"))), "C:");
+        assert_eq!(root_name('C', Some(Path::new(r"C:\Users\ADMIN~1\inner\"))), r"C:\Users\ADMIN~1\inner");
+        assert_eq!(root_name('C', Some(Path::new(r"\\?\C:\Users\me"))), r"C:\Users\me");
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(root_name('C', Some(Path::new("rel"))), cwd.join("rel").to_string_lossy());
+    }
+
+    #[test]
     fn missing_volume_is_err_not_panic() {
         let letter = ('D'..='Z').find(|l| !Path::new(&format!("{l}:\\")).exists()).expect("a free drive letter");
         let result = scan_volume(letter, None, &AtomicBool::new(false), &mut |_, _| {});
@@ -579,7 +601,8 @@ mod tests {
 
         let t = scan_volume('C', Some(&inner), &AtomicBool::new(false), &mut |_, _| {}).unwrap();
 
-        assert_eq!(t.nodes[t.root.0 as usize].name, "inner");
-        assert_eq!(paths(&t), ["inner", "inner\\kept.bin"]);
+        let want = inner.to_string_lossy().into_owned();
+        assert_eq!(t.nodes[t.root.0 as usize].name, want);
+        assert_eq!(paths(&t), [want.clone(), format!(r"{want}\kept.bin")]);
     }
 }

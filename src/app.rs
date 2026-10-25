@@ -7,7 +7,7 @@ use crate::scan::{self, ScanEvent, ScanHandle, ScanMode, ScanTarget};
 use crate::{ui_legend, ui_tree, ui_treemap::{self, TreemapCache}};
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 
 pub struct AppState {
     pub tree: Option<Tree>,
@@ -105,7 +105,18 @@ impl AppState {
 
     /// Applies the scan events that arrived since the last call.
     pub fn pump(&mut self) {
-        while let Ok(event) = self.rx.try_recv() {
+        loop {
+            let event = match self.rx.try_recv() {
+                Ok(event) => event,
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => {
+                    // The scan thread ended without Done or Failed (it panicked).
+                    if self.scan.take().is_some() {
+                        self.error = Some("scan stopped unexpectedly".into());
+                    }
+                    return;
+                }
+            };
             match event {
                 ScanEvent::Progress { files, bytes } => self.progress = (files, bytes),
                 ScanEvent::Done { tree, mode, skipped } => {
@@ -405,5 +416,30 @@ mod tests {
         state.pump();
         assert_eq!(state.error.as_deref(), Some("cannot read C:\\"));
         assert!(state.scan.is_none());
+    }
+
+    #[test]
+    fn scan_thread_that_dies_without_a_result_is_an_error() {
+        let mut state = AppState::new();
+        let tx = state.install_channel();
+        state.scan = Some(ScanHandle::detached());
+        tx.send(ScanEvent::Progress { files: 1, bytes: 1 }).unwrap();
+        drop(tx);
+        state.pump();
+        assert_eq!(state.error.as_deref(), Some("scan stopped unexpectedly"));
+        assert!(state.scan.is_none());
+        assert_eq!(state.progress, (1, 1));
+    }
+
+    #[test]
+    fn finished_scan_closing_its_channel_is_not_an_error() {
+        let mut state = AppState::new();
+        let tx = state.install_channel();
+        state.scan = Some(ScanHandle::detached());
+        tx.send(ScanEvent::Done { tree: tree(), mode: ScanMode::Walk, skipped: 0 }).unwrap();
+        drop(tx);
+        state.pump();
+        assert!(state.error.is_none());
+        assert!(state.tree.is_some());
     }
 }

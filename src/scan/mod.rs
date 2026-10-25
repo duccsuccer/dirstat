@@ -44,6 +44,12 @@ impl ScanHandle {
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::SeqCst);
     }
+
+    /// A handle with no scan thread behind it, for tests of the UI state.
+    #[cfg(test)]
+    pub(crate) fn detached() -> Self {
+        ScanHandle { cancel: Arc::new(AtomicBool::new(false)) }
+    }
 }
 
 impl Drop for ScanHandle {

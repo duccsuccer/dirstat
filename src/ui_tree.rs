@@ -30,9 +30,14 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
     let mut click = None;
 
     header(ui, row_h);
-    egui::ScrollArea::vertical()
-        .auto_shrink([false, false])
-        .show_rows(ui, row_h, rows.len(), |ui, range| {
+    let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]);
+    if state.scroll_to_selected {
+        state.scroll_to_selected = false;
+        if let Some(row) = selected.and_then(|id| rows.iter().position(|&(r, _)| r == id)) {
+            scroll = scroll.vertical_scroll_offset(row as f32 * (row_h + ui.spacing().item_spacing.y));
+        }
+    }
+    scroll.show_rows(ui, row_h, rows.len(), |ui, range| {
             for &(id, depth) in &rows[range] {
                 let node = &tree.nodes[id.0 as usize];
                 let expandable = node.is_dir && !node.children.is_empty();

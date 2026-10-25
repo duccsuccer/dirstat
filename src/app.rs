@@ -3,7 +3,7 @@
 use eframe::egui;
 use crate::model::{NodeId, Tree};
 use crate::scan::{self, ScanEvent, ScanHandle, ScanMode, ScanTarget};
-use crate::{ui_legend, ui_tree, ui_treemap};
+use crate::{ui_legend, ui_tree, ui_treemap::{self, TreemapCache}};
 use std::collections::HashSet;
 use std::sync::mpsc::{channel, Receiver, Sender};
 
@@ -18,6 +18,9 @@ pub struct AppState {
     pub target: Option<ScanTarget>,
     pub error: Option<String>,
     pub skipped: u64,
+    pub treemap_cache: Option<TreemapCache>,
+    /// Set by a treemap click; the tree pane scrolls to `selected` once, then clears it.
+    pub scroll_to_selected: bool,
 }
 
 impl AppState {
@@ -34,6 +37,8 @@ impl AppState {
             target: None,
             error: None,
             skipped: 0,
+            treemap_cache: None,
+            scroll_to_selected: false,
         }
     }
 
@@ -54,6 +59,11 @@ impl AppState {
         self.target = Some(target);
     }
 
+    /// Drops the cached treemap layout so the next frame recomputes it (call after the tree changes).
+    pub fn invalidate_treemap(&mut self) {
+        self.treemap_cache = None;
+    }
+
     /// Applies the scan events that arrived since the last call.
     pub fn pump(&mut self) {
         while let Ok(event) = self.rx.try_recv() {
@@ -62,6 +72,7 @@ impl AppState {
                 ScanEvent::Done { tree, mode, skipped } => {
                     self.expanded = HashSet::from([tree.root]);
                     self.selected = None;
+                    self.treemap_cache = None;
                     self.tree = Some(tree);
                     self.mode = Some(mode);
                     self.skipped = skipped;

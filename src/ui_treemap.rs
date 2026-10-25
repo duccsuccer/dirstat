@@ -39,10 +39,10 @@ pub struct TreemapCache {
 }
 
 impl TreemapCache {
-    /// `size` in physical pixels; `ppp` is pixels per point.
-    fn new(tree: &Tree, size: (f32, f32), ppp: f32) -> Self {
+    /// Lays out the folder `root` and below it; `size` in physical pixels, `ppp` pixels per point.
+    fn new(tree: &Tree, root: NodeId, size: (f32, f32), ppp: f32) -> Self {
         let bounds = treemap::Rect { x: 0.0, y: 0.0, w: size.0.floor(), h: size.1.floor() };
-        let (blocks, dirs) = treemap::layout_with_headers(tree, tree.root, bounds, header_px(ppp));
+        let (blocks, dirs) = treemap::layout_with_headers(tree, root, bounds, header_px(ppp));
         // Paint order: the border colour under everything, then folders (parents first), then files. Each rect leaves
         // its right and bottom pixel unpainted, which shows as a 1px line between neighbours. Labels and the
         // selection outline are drawn over this mesh.
@@ -81,7 +81,8 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
         placeholder(ui, state);
         return;
     };
-    ui.vertical_centered(|ui| ui.strong(shell_path(tree.path(tree.root))));
+    let root = state.treemap_root;
+    ui.vertical_centered(|ui| ui.strong(shell_path(tree.path(root))));
     let size = ui.available_size();
     let (response, painter) = ui.allocate_painter(size, Sense::click());
     let origin = response.rect.min;
@@ -92,7 +93,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
     if needs_relayout(state.treemap_cache.as_ref().map(|c| c.size), size) {
         state.treemap_cache = None;
     }
-    let cache = state.treemap_cache.get_or_insert_with(|| TreemapCache::new(tree, size, ppp));
+    let cache = state.treemap_cache.get_or_insert_with(|| TreemapCache::new(tree, root, size, ppp));
     cache.place(origin);
     if cache.highlight_for != state.selected {
         // A framed folder is outlined as one box, anything else block by block.
@@ -243,7 +244,7 @@ pub fn blocks_under(tree: &Tree, blocks: &[(NodeId, treemap::Rect)], id: NodeId)
 }
 
 /// True when `node` is `ancestor` or lies below it.
-fn is_within(tree: &Tree, mut node: NodeId, ancestor: NodeId) -> bool {
+pub(crate) fn is_within(tree: &Tree, mut node: NodeId, ancestor: NodeId) -> bool {
     loop {
         if node == ancestor {
             return true;

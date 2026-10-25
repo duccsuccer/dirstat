@@ -1,10 +1,10 @@
 //! Application state, the scan lifecycle and the top bar.
 
 use eframe::egui;
-use crate::actions::{self, AppItem, Chosen};
+use crate::actions::{self, AppItem, Chosen, Entry};
 use crate::model::{NodeId, Tree};
 use crate::scan::{self, ScanEvent, ScanHandle, ScanMode, ScanTarget};
-use crate::{ui_legend, ui_tree, ui_treemap::{self, TreemapCache}};
+use crate::{ui_legend, ui_tree, ui_treemap::{self, is_within, TreemapCache}};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
@@ -23,6 +23,8 @@ pub struct AppState {
     pub error: Option<String>,
     pub skipped: u64,
     pub treemap_cache: Option<TreemapCache>,
+    /// The folder the treemap shows, below the scan root after a Zoom in; the scan root once a tree is shown.
+    pub treemap_root: NodeId,
     /// Set by a treemap click; the tree pane scrolls to `selected` once, then clears it.
     pub scroll_to_selected: bool,
     /// Item right-clicked in the last frame, and whether Shift was held; its shell menu opens in the next frame,
@@ -60,6 +62,7 @@ impl AppState {
             error: None,
             skipped: 0,
             treemap_cache: None,
+            treemap_root: NodeId(0),
             scroll_to_selected: false,
             pending_menu: None,
             hwnd: 0,
@@ -106,14 +109,8 @@ impl AppState {
             return;
         }
         let path = actions::shell_path(tree.path(id));
-        let items = [
-            (AppItem::Explore, true),
-            (AppItem::CommandPrompt, true),
-            (AppItem::CopyPath, true),
-            (AppItem::Export, true),
-            (AppItem::CopyInfo, true),
-        ];
-        match actions::show_context_menu(HWND(self.hwnd as *mut _), Path::new(&path), extended, &items, has_shell_menu(tree, id)) {
+        let entries = menu_entries(tree, id, self.treemap_root);
+        match actions::show_context_menu(HWND(self.hwnd as *mut _), Path::new(&path), extended, &entries, has_shell_menu(tree, id)) {
             Ok(Chosen::Shell) => self.forget_if_gone(id, exists),
             Ok(Chosen::App(item)) => self.app_item(id, item),
             Ok(Chosen::Nothing) => {}
@@ -142,6 +139,16 @@ impl AppState {
                 std::fs::write(&file, csv_export(tree, id)).map_err(|e| format!("{}: {e}", file.display()))
             }
             AppItem::CopyInfo => actions::copy_text(&info_line(tree, id)).map_err(|e| format!("{path}: {e}")),
+            AppItem::ZoomIn => {
+                self.treemap_root = folder_of(tree, id);
+                self.invalidate_treemap();
+                Ok(())
+            }
+            AppItem::ZoomOut => {
+                self.treemap_root = zoom_out_root(tree, self.treemap_root);
+                self.invalidate_treemap();
+                Ok(())
+            }
         };
         if let Err(e) = result {
             self.error = Some(e);
@@ -156,8 +163,13 @@ impl AppState {
         if !tree.is_attached(id) || !has_shell_menu(tree, id) || exists(Path::new(&tree.path(id))) {
             return;
         }
-        self.selected = tree.nodes[id.0 as usize].parent;
+        let parent = tree.nodes[id.0 as usize].parent;
+        self.selected = parent;
         tree.remove(id);
+        // A treemap root that was removed (or lay inside the removed folder) shows its parent instead.
+        if !tree.is_attached(self.treemap_root) {
+            self.treemap_root = parent.unwrap_or(tree.root);
+        }
         self.invalidate_treemap();
     }
 
@@ -192,6 +204,7 @@ impl AppState {
                 ScanEvent::Done { tree, mode, skipped } => {
                     self.expanded = HashSet::from([tree.root]);
                     self.selected = None;
+                    self.treemap_root = tree.root;
                     // Ids from the old tree may name a different item in the new one.
                     self.pending_menu = None;
                     self.treemap_cache = None;
@@ -229,7 +242,7 @@ impl eframe::App for AppState {
         });
         egui::Panel::bottom("status").show(ui, |ui| {
             if let Some(tree) = &self.tree {
-                ui.label(selection_status(tree, self.selected.unwrap_or(tree.root)));
+                ui.label(selection_status(tree, status_node(tree, self.selected, self.treemap_root)));
             }
         });
         let treemap_height = ui.ctx().content_rect().height() * 0.4;
@@ -418,6 +431,34 @@ pub fn info_line(tree: &Tree, id: NodeId) -> String {
         folders.to_string(),
     ]
     .join("\t")
+}
+
+/// dirstat's part of the context menu for item `id`, while the treemap shows `treemap_root`. Zoom in is grayed when
+/// the treemap already shows the item's folder, Zoom out at the scan root.
+pub(crate) fn menu_entries(tree: &Tree, id: NodeId, treemap_root: NodeId) -> [Entry; 8] {
+    [
+        Entry::Item(AppItem::Explore, true),
+        Entry::Item(AppItem::CommandPrompt, true),
+        Entry::Item(AppItem::CopyPath, true),
+        Entry::Item(AppItem::Export, true),
+        Entry::Item(AppItem::CopyInfo, true),
+        Entry::Separator,
+        Entry::Item(AppItem::ZoomIn, folder_of(tree, id) != treemap_root),
+        Entry::Item(AppItem::ZoomOut, treemap_root != tree.root),
+    ]
+}
+
+/// The treemap root after Zoom out: the parent of `root`, or `root` itself at the scan root.
+pub(crate) fn zoom_out_root(tree: &Tree, root: NodeId) -> NodeId {
+    tree.nodes[root.0 as usize].parent.unwrap_or(root)
+}
+
+/// The item the status line describes: the selection while it lies inside the treemap's root, else the root.
+pub(crate) fn status_node(tree: &Tree, selected: Option<NodeId>, treemap_root: NodeId) -> NodeId {
+    match selected {
+        Some(id) if is_within(tree, id, treemap_root) => id,
+        _ => treemap_root,
+    }
 }
 
 /// The CSV file Export writes for item `id` and everything below it: a header, then one row per folder and file,
@@ -662,6 +703,75 @@ mod tests {
         assert_eq!(csv_field("a,b"), "\"a,b\"");
         assert_eq!(csv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
         assert_eq!(csv_field("two\r\nlines"), "\"two\r\nlines\"");
+    }
+
+    #[test]
+    fn zoom_out_goes_to_the_parent_and_stops_at_the_root() {
+        let (state, a, _) = state_with_file();
+        let tree = state.tree.as_ref().unwrap();
+        assert_eq!(zoom_out_root(tree, a), tree.root);
+        assert_eq!(zoom_out_root(tree, tree.root), tree.root);
+    }
+
+    #[test]
+    fn zoom_menu_items_are_grayed_when_they_would_do_nothing() {
+        let (state, a, f) = state_with_file();
+        let tree = state.tree.as_ref().unwrap();
+        let root = tree.root;
+        let zoom = |entries: [Entry; 8]| (entries[6], entries[7]);
+        // Scan root shown: the root's own folder is already shown, and there is nothing above it.
+        assert_eq!(zoom(menu_entries(tree, root, root)), (Entry::Item(AppItem::ZoomIn, false), Entry::Item(AppItem::ZoomOut, false)));
+        // Folder a shown: a file in it is shown already, and the root is one step up.
+        assert_eq!(zoom(menu_entries(tree, f, a)), (Entry::Item(AppItem::ZoomIn, false), Entry::Item(AppItem::ZoomOut, true)));
+        // Folder a shown, the root's own item (g.bin) zooms in to the root, which is not shown yet.
+        assert_eq!(zoom(menu_entries(tree, NodeId(3), a)), (Entry::Item(AppItem::ZoomIn, true), Entry::Item(AppItem::ZoomOut, true)));
+    }
+
+    #[test]
+    fn zoom_actions_move_the_treemap_root_and_drop_its_layout() {
+        let (mut state, a, f) = state_with_file();
+        let root = state.tree.as_ref().unwrap().root;
+        state.treemap_cache = Some(TreemapCache {
+            size: (1.0, 1.0),
+            blocks: Vec::new(),
+            mesh: Default::default(),
+            origin: egui::Pos2::ZERO,
+            dirs: Vec::new(),
+            highlight_for: None,
+            highlight: Default::default(),
+        });
+        state.app_item(f, AppItem::ZoomIn);
+        assert_eq!(state.treemap_root, a);
+        assert!(state.treemap_cache.is_none());
+        assert_eq!(state.selected, Some(f), "the tree selection stays");
+        state.app_item(f, AppItem::ZoomOut);
+        assert_eq!(state.treemap_root, root);
+    }
+
+    #[test]
+    fn removing_the_treemap_root_moves_it_to_its_parent() {
+        let (mut state, a, _) = state_with_file();
+        let root = state.tree.as_ref().unwrap().root;
+        state.treemap_root = a;
+        state.forget_if_gone(a, |_| false);
+        assert_eq!(state.treemap_root, root);
+    }
+
+    #[test]
+    fn removing_another_item_keeps_the_treemap_root() {
+        let (mut state, a, _) = state_with_file();
+        state.treemap_root = a;
+        state.forget_if_gone(NodeId(3), |_| false); // g.bin
+        assert_eq!(state.treemap_root, a);
+    }
+
+    #[test]
+    fn status_follows_the_selection_inside_the_treemap_root() {
+        let (state, a, f) = state_with_file();
+        let tree = state.tree.as_ref().unwrap();
+        assert_eq!(status_node(tree, Some(f), a), f);
+        assert_eq!(status_node(tree, Some(NodeId(3)), a), a, "g.bin is outside folder a");
+        assert_eq!(status_node(tree, None, a), a);
     }
 
     #[test]

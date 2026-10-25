@@ -56,10 +56,20 @@ pub enum AppItem {
     CopyPath,
     Export,
     CopyInfo,
+    ZoomIn,
+    ZoomOut,
 }
 
 impl AppItem {
-    const ALL: [AppItem; 5] = [AppItem::Explore, AppItem::CommandPrompt, AppItem::CopyPath, AppItem::Export, AppItem::CopyInfo];
+    const ALL: [AppItem; 7] = [
+        AppItem::Explore,
+        AppItem::CommandPrompt,
+        AppItem::CopyPath,
+        AppItem::Export,
+        AppItem::CopyInfo,
+        AppItem::ZoomIn,
+        AppItem::ZoomOut,
+    ];
 
     fn label(self) -> &'static str {
         match self {
@@ -68,6 +78,8 @@ impl AppItem {
             AppItem::CopyPath => "Copy Path",
             AppItem::Export => "Export to .CSV file...",
             AppItem::CopyInfo => "Copy file and size info to clipboard",
+            AppItem::ZoomIn => "Zoom in Treemap",
+            AppItem::ZoomOut => "Zoom out Treemap",
         }
     }
 
@@ -81,6 +93,13 @@ impl AppItem {
     }
 }
 
+/// One line of dirstat's part of the menu: an item, enabled or grayed, or a separator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Entry {
+    Item(AppItem, bool),
+    Separator,
+}
+
 /// What the user chose in the context menu.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Chosen {
@@ -91,17 +110,17 @@ pub enum Chosen {
     Shell,
 }
 
-/// Shows dirstat's items `items` (each with whether it is enabled) at the mouse pointer, owned by window `hwnd`.
-/// When `shell` is set, Explorer's own items for `path` follow them after a separator; `extended` adds the verbs
-/// Explorer shows when Shift is held. A shell command that is chosen runs before this returns.
-pub fn show_context_menu(hwnd: HWND, path: &Path, extended: bool, items: &[(AppItem, bool)], shell: bool) -> WinResult<Chosen> {
+/// Shows dirstat's `entries` at the mouse pointer, owned by window `hwnd`. When `shell` is set, Explorer's own items
+/// for `path` follow them after a separator; `extended` adds the verbs Explorer shows when Shift is held. A shell
+/// command that is chosen runs before this returns.
+pub fn show_context_menu(hwnd: HWND, path: &Path, extended: bool, entries: &[Entry], shell: bool) -> WinResult<Chosen> {
     let _com = ComApartment::enter();
     let menu = if shell { Some(context_menu(hwnd, path)?) } else { None };
     // Read every time, so a theme switch while dirstat runs shows on the next menu.
     apply_menu_theme(menu_app_mode(apps_use_light_theme()));
     let id = unsafe {
         let popup = CreatePopupMenu()?;
-        let chosen = track(menu.as_ref(), items, popup, hwnd, extended);
+        let chosen = track(menu.as_ref(), entries, popup, hwnd, extended);
         let _ = DestroyMenu(popup);
         chosen?
     };
@@ -126,13 +145,18 @@ pub fn show_context_menu(hwnd: HWND, path: &Path, extended: bool, items: &[(AppI
     }
 }
 
-/// Fills `popup` with `items`, then the shell's items after a separator when `menu` is set, and shows it at the mouse
+/// Fills `popup` with `entries`, then the shell's items after a separator when `menu` is set, and shows it at the mouse
 /// pointer until the user picks one (its id) or dismisses it (0).
-unsafe fn track(menu: Option<&IContextMenu>, items: &[(AppItem, bool)], popup: HMENU, hwnd: HWND, extended: bool) -> WinResult<u32> {
+unsafe fn track(menu: Option<&IContextMenu>, entries: &[Entry], popup: HMENU, hwnd: HWND, extended: bool) -> WinResult<u32> {
     unsafe {
-        for &(item, enabled) in items {
-            let state = if enabled { MF_ENABLED } else { MF_GRAYED };
-            AppendMenuW(popup, MF_STRING | state, item.id() as usize, &HSTRING::from(item.label()))?;
+        for &entry in entries {
+            match entry {
+                Entry::Item(item, enabled) => {
+                    let state = if enabled { MF_ENABLED } else { MF_GRAYED };
+                    AppendMenuW(popup, MF_STRING | state, item.id() as usize, &HSTRING::from(item.label()))?;
+                }
+                Entry::Separator => AppendMenuW(popup, MF_SEPARATOR, 0, PCWSTR::null())?,
+            }
         }
         let mut at = POINT::default();
         if let Some(menu) = menu {
